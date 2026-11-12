@@ -1,5 +1,5 @@
 name: WayBridge
-version: 1.0.0
+version: 1.0.4
 main: com.iruixos.waybridge.WayBridge
 api-version: '26.3'
 author: iruixos
@@ -8,7 +8,7 @@ softdepend: [WorldGuard]
 commands:
   waybridge:
     description: WayBridge information and administration
-    usage: /waybridge [help|list|inspect|private|public|invite|uninvite|invites|relink|reload|migrate]
+    usage: /waybridge [help|list|inspect|private|public|invite|uninvite|invites|relink|reservation|reload|migrate]
 permissions:
   waybridge.create.target:
     default: true

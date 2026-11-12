@@ -79,6 +79,9 @@ public final class WayBridge extends JavaPlugin implements Listener {
   private final Deque<ChunkKey> pendingRefreshChunks = new ArrayDeque<>();
   private final Set<ChunkKey> queuedRefreshChunks = new HashSet<>();
   private final Deque<Store.Entry> pendingSignRefreshes = new ArrayDeque<>();
+  // A changed target may be in an unloaded chunk. Retain its refresh request
+  // independently of the bounded cosmetic chunk queue, until its chunk loads.
+  private final Map<String,Store.Entry> dirtyTargets = new HashMap<>();
   private BukkitTask refreshWorker;
   private BukkitTask diagnosticWorker;
   private Logger diagnosticLogger;
@@ -109,6 +112,56 @@ public final class WayBridge extends JavaPlugin implements Listener {
   private final Map<UUID,PrivacySelection> privacySelections=new HashMap<>();
   private final Map<UUID,Long> relinkSelections=new HashMap<>();
   private final Map<UUID,Long> cooldown=new HashMap<>();
+  private record PendingReservation(String name,UUID owner,int links,UUID token,long expiresAt) {}
+  private final Map<String,PendingReservation> pendingReservations=new HashMap<>();
+  private static String reservationActor(org.bukkit.command.CommandSender sender) {
+    return sender instanceof Player p?p.getUniqueId().toString():"console:"+sender.getName();
+  }
+  private void reservationMessage(org.bukkit.command.CommandSender sender,String message) {
+    sender.sendMessage(Component.text("[WayBridge]: ",NamedTextColor.AQUA).append(Component.text(message,NamedTextColor.WHITE)));
+  }
+  private void reservationCommand(org.bukkit.command.CommandSender sender,String[] args) {
+    if(!sender.hasPermission("waybridge.admin")){sender.sendMessage("§cAdministrator permission required.");return;}
+    if(args.length<2){reservationMessage(sender,"Usage: /waybridge reservation info <name> | clear <name> | confirm <token>");return;}
+    String action=args[1].toLowerCase(Locale.ROOT);
+    try {
+      if(action.equals("confirm")){
+        String actor=reservationActor(sender);
+        PendingReservation pending=pendingReservations.remove(actor);
+        if(pending==null||args.length!=3||!pending.token().toString().equals(args[2])||System.currentTimeMillis()>pending.expiresAt()){
+          reservationMessage(sender,"Confirmation missing, expired, or invalid. Run /waybridge reservation clear <name> again.");return;
+        }
+        if(store.target(pending.name())!=null){reservationMessage(sender,"An active WarpTarget now uses this name; clearing refused.");return;}
+        if(!store.clearReservation(pending.name(),pending.owner(),pending.links())){
+          reservationMessage(sender,"Reservation changed since preview; no changes made. Inspect it again.");return;
+        }
+        getLogger().warning("Admin "+sender.getName()+" cleared reservation for '"+pending.name()+"' previously owned by "+pending.owner()+" ("+pending.links()+" orphaned signs retained).");
+        reservationMessage(sender,"Cleared name reservation for '"+pending.name()+"'. Existing orphaned Warp signs were not modified or relinked.");
+        return;
+      }
+      if(!(action.equals("info")||action.equals("clear"))||args.length<3){
+        reservationMessage(sender,"Usage: /waybridge reservation info <name> | clear <name> | confirm <token>");return;
+      }
+      String name=String.join(" ",java.util.Arrays.copyOfRange(args,2,args.length)).trim();
+      if(!NAME.matcher(name).matches()){reservationMessage(sender,"Invalid name (1–16 letters, digits, spaces, _ or -).");return;}
+      Store.Reservation claim=store.reservation(name);
+      Store.Entry active=store.target(name);
+      if(claim==null){reservationMessage(sender,"No reservation found for '"+name+"'."+(active==null?"":" An active WarpTarget exists."));return;}
+      String ownerName=Objects.requireNonNullElse(Bukkit.getOfflinePlayer(claim.owner()).getName(),claim.owner().toString());
+      reservationMessage(sender,"Reservation '"+claim.name()+"': owner "+ownerName+" ("+claim.owner()+"), "+claim.linkedSigns()+" associated Warp sign(s), active target: "+(active==null?"no":"yes")+".");
+      if(action.equals("info"))return;
+      if(active!=null){reservationMessage(sender,"Cannot clear an active WarpTarget's reservation. Remove the target normally first.");return;}
+      UUID token=UUID.randomUUID();
+      pendingReservations.put(reservationActor(sender),new PendingReservation(claim.name(),claim.owner(),claim.linkedSigns(),token,System.currentTimeMillis()+30000));
+      sender.sendMessage(Component.text("[WayBridge]: ",NamedTextColor.AQUA)
+          .append(Component.text("WARNING: Clearing permits another player to claim this name; "+claim.linkedSigns()+" orphaned sign(s) remain unchanged. ",NamedTextColor.GOLD))
+          .append(Component.text("[Confirm Clear]",NamedTextColor.RED)
+              .clickEvent(ClickEvent.runCommand("/waybridge reservation confirm "+token))
+              .hoverEvent(HoverEvent.showText(Component.text("Confirm within 30 seconds")))));
+      reservationMessage(sender,"Confirmation expires in 30 seconds. Nothing has been changed yet.");
+    }catch(SQLException ex){error(ex);reservationMessage(sender,"Unable to inspect or update the reservation; check server logs.");}
+  }
+
   private static final Pattern NAME=Pattern.compile("[A-Za-z0-9_ -]{1,16}");
   private static final Set<Material> EDIT_ITEMS=EnumSet.of(Material.GLOW_INK_SAC,Material.INK_SAC,Material.HONEYCOMB,Material.BLACK_DYE,Material.BLUE_DYE,Material.BROWN_DYE,Material.CYAN_DYE,Material.GRAY_DYE,Material.GREEN_DYE,Material.LIGHT_BLUE_DYE,Material.LIGHT_GRAY_DYE,Material.LIME_DYE,Material.MAGENTA_DYE,Material.ORANGE_DYE,Material.PINK_DYE,Material.PURPLE_DYE,Material.RED_DYE,Material.WHITE_DYE,Material.YELLOW_DYE);
   @Override public void onEnable() {
@@ -161,6 +214,9 @@ public final class WayBridge extends JavaPlugin implements Listener {
         }catch(SQLException ex){error(ex);p.sendMessage("§cCould not update invitations.");}
         return true;
       }
+      if(args[0].equalsIgnoreCase("reservation")) {
+        reservationCommand(sender,args);return true;
+      }
       if(args[0].equalsIgnoreCase("migrate")) {
         if(!sender.hasPermission("waybridge.admin")){sender.sendMessage("§cAdministrator permission required.");return true;}
         migration.command(sender,java.util.Arrays.copyOfRange(args,1,args.length));return true;
@@ -212,8 +268,8 @@ public final class WayBridge extends JavaPlugin implements Listener {
     sender.sendMessage(Component.text("──────── WayBridge Help ("+page+"/2) ────────",NamedTextColor.AQUA));
     if(page==1) {
       sender.sendMessage(Component.text("Create and use warp signs",NamedTextColor.WHITE));
-      helpLine(sender,"[WarpTarget]","Line 1: create a destination sign");
-      helpLine(sender,"[Warp]","Line 1: create a sign to travel there");
+      helpLine(sender,"[WarpTarget] / [WPT]","Line 1: create a destination (short form for hanging signs)");
+      helpLine(sender,"[Warp] / [WP]","Line 1: create a connecting sign (short form for hanging signs)");
       sender.sendMessage(Component.text("  Line 2: warp name (1–16 letters, digits, spaces, _ or -)",NamedTextColor.GRAY));
       sender.sendMessage(Component.text("  WarpTarget line 3: Private (optional, case-insensitive)",NamedTextColor.GRAY));
       sender.sendMessage(Component.text("  Other lines are filled automatically",NamedTextColor.GRAY));
@@ -229,6 +285,8 @@ public final class WayBridge extends JavaPlugin implements Listener {
       helpLine(sender,"/waybridge invite <target> <player>","Grant private access");
       helpLine(sender,"/waybridge uninvite <target> <player>","Revoke private access");
       helpLine(sender,"/waybridge invites <target>","List invited players");
+      if(sender.hasPermission("waybridge.admin"))helpLine(sender,"/waybridge reservation info <name>","Inspect a name reservation (admin)");
+      if(sender.hasPermission("waybridge.admin"))helpLine(sender,"/waybridge reservation clear <name>","Safely clear a name reservation with confirmation (admin)");
       if(sender.hasPermission("waybridge.admin"))helpLine(sender,"/waybridge reload","Reload configuration (admin)");
       if(sender.hasPermission("waybridge.admin"))helpLine(sender,"/waybridge migrate","SignWarpX migration and rollback wizards (admin)");
       sender.sendMessage(Component.text("  Registered signs cannot be edited; break and recreate them",NamedTextColor.GRAY));
@@ -275,7 +333,7 @@ public final class WayBridge extends JavaPlugin implements Listener {
       getLogger().warning("Could not count registered signs: " + ex.getMessage());
     }
   }
-  @Override public void onDisable(){if(refreshWorker!=null)refreshWorker.cancel();if(diagnosticWorker!=null)diagnosticWorker.cancel();pendingRefreshChunks.clear();queuedRefreshChunks.clear();pendingSignRefreshes.clear();activeTeleports.clear();teleportOrigins.clear();waybridgeTeleportEvents.clear();for(UUID id:new ArrayList<>(pendingTeleports.keySet())) cancelCountdown(id,null);privacySelections.clear();relinkSelections.clear();if(migration!=null)migration.stop();if(store!=null)try{store.close();}catch(Exception e){getLogger().warning(e.toString());}closeDiagnosticLogging();}
+  @Override public void onDisable(){if(refreshWorker!=null)refreshWorker.cancel();if(diagnosticWorker!=null)diagnosticWorker.cancel();pendingRefreshChunks.clear();queuedRefreshChunks.clear();pendingSignRefreshes.clear();dirtyTargets.clear();activeTeleports.clear();teleportOrigins.clear();waybridgeTeleportEvents.clear();for(UUID id:new ArrayList<>(pendingTeleports.keySet())) cancelCountdown(id,null);privacySelections.clear();relinkSelections.clear();pendingReservations.clear();if(migration!=null)migration.stop();if(store!=null)try{store.close();}catch(Exception e){getLogger().warning(e.toString());}closeDiagnosticLogging();}
   private void error(Exception ex){getLogger().severe("Database error: "+ex);}
   private boolean admin(Player p){return p.isOp()||p.hasPermission("waybridge.admin");}
   private boolean region(Player p,Location l){
@@ -325,7 +383,7 @@ public final class WayBridge extends JavaPlugin implements Listener {
     for(int i=0;i<signBudget&&!pendingSignRefreshes.isEmpty();i++) {
       Store.Entry entry=pendingSignRefreshes.pollFirst();
       long start=System.nanoTime();
-      write(entry);  // write already refuses to load unloaded chunks.
+      write(entry);  // Re-reads the current row before rendering.
       signRefreshNanos+=System.nanoTime()-start;
       signRefreshes++;
     }
@@ -384,11 +442,32 @@ public final class WayBridge extends JavaPlugin implements Listener {
     chunkLookupNanos=signRefreshNanos=physicsLookupNanos=0;
     chunkLookups=signRefreshes=physicsLookups=skippedSignUpdates=0;
   }
+  // Both full and short sign headers are first-class formats. Keep the header
+  // chosen by the player so hanging signs never overflow their text area.
+  static boolean targetHeader(String header) {
+    return header.equalsIgnoreCase("[WarpTarget]") || header.equalsIgnoreCase("[WPT]");
+  }
+  static boolean warpHeader(String header) {
+    return header.equalsIgnoreCase("[Warp]") || header.equalsIgnoreCase("[WP]");
+  }
+  static boolean matchesHeader(String header, String kind) {
+    return kind.equals("TARGET") ? targetHeader(header) : warpHeader(header);
+  }
   private static boolean signMaterial(Material material) {
     String name=material.name();
     return name.endsWith("_SIGN")||name.endsWith("_HANGING_SIGN");
   }
   void write(Store.Entry e){
+    // Entries held by the cosmetic queue can be older than the database. Never
+    // let an old queued sign render overwrite a newer registration or count.
+    try {
+      Location registeredLocation=e.location();
+      if(registeredLocation==null||!registeredLocation.isChunkLoaded())return;
+      Store.Entry current=store.at(registeredLocation);
+      if(current==null||!current.equals(e))return;
+      if(!Objects.equals(store.targetId(current),store.targetId(e)))return;
+      e=current;
+    }catch(SQLException ex){error(ex);return;}
     Location loc=e.location();if(loc==null||!loc.isChunkLoaded())return;
     if(!(loc.getBlock().getState() instanceof Sign sign)){
       warnSignUpdate(e.position(),"Registered sign block is missing; cannot refresh");return;
@@ -396,21 +475,22 @@ public final class WayBridge extends JavaPlugin implements Listener {
     // Never rewrite an unrelated replacement sign at a stale registered location.
     String currentHeader=net.kyori.adventure.text.serializer.plain.PlainTextComponentSerializer.plainText().serialize(sign.getSide(org.bukkit.block.sign.Side.FRONT).line(0)).trim();
     String currentName=net.kyori.adventure.text.serializer.plain.PlainTextComponentSerializer.plainText().serialize(sign.getSide(org.bukkit.block.sign.Side.FRONT).line(1)).trim();
-    if(!currentHeader.equalsIgnoreCase(e.kind().equals("TARGET")?"[WarpTarget]":"[Warp]") || !currentName.equalsIgnoreCase(e.name())){
+    if(!matchesHeader(currentHeader,e.kind()) || !currentName.equalsIgnoreCase(e.name())){
       warnSignUpdate(e.position(),"Registered sign differs from world block; refusing to rewrite it");
       return;
     }
     try {
       Store.Entry target=e.kind().equals("TARGET")?e:store.target(e.name());
-      boolean connected=e.kind().equals("TARGET")?store.linkedCount(e)>0:target!=null&&store.validLink(e,target);
+      int linkCount=e.kind().equals("TARGET")?store.linkedCount(e):0;
+      boolean connected=e.kind().equals("TARGET")?linkCount>0:target!=null&&store.validLink(e,target);
       boolean privateTarget=target!=null&&(e.kind().equals("TARGET")||connected)&&store.isPrivate(target);
       NamedTextColor color=(e.kind().equals("WARP")&&!connected)?NamedTextColor.RED:privateTarget?NamedTextColor.LIGHT_PURPLE:(e.kind().equals("TARGET")?(connected?NamedTextColor.GREEN:NamedTextColor.YELLOW):NamedTextColor.GREEN);
       var side=sign.getSide(org.bukkit.block.sign.Side.FRONT);
       List<Component> before=List.of(side.line(0),side.line(1),side.line(2),side.line(3));
-      side.line(0,Component.text(e.kind().equals("TARGET")?"[WarpTarget]":"[Warp]",color));
+      side.line(0,Component.text(currentHeader,color));
       side.line(1,Component.text(e.name()));
       side.line(2,Component.text(Objects.requireNonNullElse(Bukkit.getOfflinePlayer(e.owner()).getName(),"Unknown")));
-      if(e.kind().equals("TARGET"))side.line(3,Component.text(privateTarget?"Private ("+store.linkedCount(e)+")":store.linkedCount(e)+" linked",privateTarget?NamedTextColor.DARK_PURPLE:NamedTextColor.BLACK));
+      if(e.kind().equals("TARGET"))side.line(3,Component.text(privateTarget?"Private ("+linkCount+")":linkCount+" linked",privateTarget?NamedTextColor.DARK_PURPLE:NamedTextColor.BLACK));
       else {
         // A public Warp sign identifies the destination dimension/world, not its coordinates.
         // Private signs deliberately retain their existing privacy indicator.
@@ -532,11 +612,42 @@ public final class WayBridge extends JavaPlugin implements Listener {
         .append(Component.text("\"" + entry.name() + "\"", NamedTextColor.DARK_PURPLE))
         .append(Component.text(created ? " created." : " deregistered.", NamedTextColor.WHITE)));
   }
-  void refresh(String name,UUID owner){try{Store.Entry t=store.target(name);if(t!=null&&t.owner().equals(owner))write(t);for(Store.Entry e:store.links(name,owner))write(e);}catch(SQLException ex){error(ex);}}
+  private void refreshTargetSign(Store.Entry target) {
+    if(target==null||!"TARGET".equals(target.kind()))return;
+    // Keep requests for unloaded targets even if the normal sign queue fills.
+    dirtyTargets.put(target.position(),target);
+    Location loc=target.location();
+    if(loc==null||!loc.isChunkLoaded())return;
+    try {
+      Store.Entry current=store.at(loc);
+      if(current==null||!current.equals(target)
+          ||!Objects.equals(store.targetId(current),store.targetId(target))) {
+        dirtyTargets.remove(target.position());return;
+      }
+      // Evaluate the link count at render time, never when the request is queued.
+      write(current);
+      // Any failed sign writes are still eligible for reconciliation on chunk load.
+      if(!signUpdateWarnings.contains(target.position()))dirtyTargets.remove(target.position());
+    }catch(SQLException ex){error(ex);}
+  }
+  private void refreshDirtyTargetsInChunk(ChunkKey key) {
+    if(dirtyTargets.isEmpty())return;
+    for(Store.Entry target:new ArrayList<>(dirtyTargets.values())) {
+      if(target.world().equals(key.world()) && (target.x()>>4)==key.x()
+          && (target.z()>>4)==key.z())refreshTargetSign(target);
+    }
+  }
+  void refresh(String name,UUID owner){
+    try {
+      Store.Entry target=store.target(name);
+      if(target!=null&&target.owner().equals(owner))refreshTargetSign(target);
+      for(Store.Entry link:store.links(name,owner))write(link);
+    }catch(SQLException ex){error(ex);}
+  }
   @EventHandler(priority=EventPriority.MONITOR,ignoreCancelled=true) public void create(SignChangeEvent event){
     if(event.getSide()!=org.bukkit.block.sign.Side.FRONT)return;
     String header=net.kyori.adventure.text.serializer.plain.PlainTextComponentSerializer.plainText().serialize(event.line(0)==null?Component.empty():event.line(0)).trim();
-    boolean target=header.equalsIgnoreCase("[WarpTarget]");boolean warp=header.equalsIgnoreCase("[Warp]");if(!target&&!warp)return;
+    boolean target=targetHeader(header);boolean warp=warpHeader(header);if(!target&&!warp)return;
     Player p=event.getPlayer();String name=net.kyori.adventure.text.serializer.plain.PlainTextComponentSerializer.plainText().serialize(event.line(1)==null?Component.empty():event.line(1)).trim();
     if(!NAME.matcher(name).matches()||name.length()>getConfig().getInt("max-name-length",16)){p.sendMessage("§cInvalid name: use up to 16 letters, digits, spaces, _ or -.");return;}
     if(!p.hasPermission(target?"waybridge.create.target":"waybridge.create.warp")||!region(p,event.getBlock().getLocation())){p.sendMessage("§cYou cannot register a sign here.");return;}
@@ -626,7 +737,7 @@ public final class WayBridge extends JavaPlugin implements Listener {
           }
           var plain=net.kyori.adventure.text.serializer.plain.PlainTextComponentSerializer.plainText();
           var front=physical.getSide(org.bukkit.block.sign.Side.FRONT);
-          if(!plain.serialize(front.line(0)).trim().equalsIgnoreCase("[Warp]")
+          if(!warpHeader(plain.serialize(front.line(0)).trim())
               ||!plain.serialize(front.line(1)).trim().equalsIgnoreCase(warp.name())){
             p.sendMessage("§cThe sign no longer matches its registration.");return;
           }
@@ -662,11 +773,11 @@ public final class WayBridge extends JavaPlugin implements Listener {
           && clicked.getState() instanceof Sign oldSign) {
         String header=net.kyori.adventure.text.serializer.plain.PlainTextComponentSerializer.plainText()
             .serialize(oldSign.getSide(org.bukkit.block.sign.Side.FRONT).line(0)).trim();
-        if(header.equalsIgnoreCase("[Warp]")||header.equalsIgnoreCase("[WarpTarget]")||header.equalsIgnoreCase("[WP]")||header.equalsIgnoreCase("[WPT]")) {
+        if(warpHeader(header)||targetHeader(header)) {
           event.setCancelled(true);
           String warpName=net.kyori.adventure.text.serializer.plain.PlainTextComponentSerializer.plainText()
               .serialize(oldSign.getSide(org.bukkit.block.sign.Side.FRONT).line(1)).trim();
-          String signType=(header.equalsIgnoreCase("[WarpTarget]")||header.equalsIgnoreCase("[WPT]"))?"WarpTarget":"Warp";
+          String signType=(targetHeader(header))?"WarpTarget":"Warp";
           if(migration!=null&&migration.isLegacySign(oldSign)){
             event.getPlayer().sendMessage(Component.text("[WayBridge]: ",NamedTextColor.AQUA)
                 .append(Component.text("Legacy SignWarpX sign detected for ",NamedTextColor.WHITE))
@@ -690,6 +801,7 @@ public final class WayBridge extends JavaPlugin implements Listener {
     event.setCancelled(true);
     if(event.getHand()!=EquipmentSlot.HAND)return;
     if(e.kind().equals("TARGET")) {
+      refreshTargetSign(e);
       showWarpTargetOptions(event.getPlayer(),e);
       return;
     }
@@ -854,6 +966,7 @@ public final class WayBridge extends JavaPlugin implements Listener {
                     ||!matchesRegisteredSign(physical,current)){
                   failTeleport(player,token,"§cTarget sign is missing or has changed.");return;
                 }
+                refreshTargetSign(current);
                 Location origin=teleportOrigins.get(playerId);
                 if(origin==null || (getConfig().getBoolean("teleport.countdown.cancel-on-movement",true)
                     && moved(origin,player.getLocation()))) {
@@ -893,7 +1006,7 @@ public final class WayBridge extends JavaPlugin implements Listener {
   private boolean matchesRegisteredSign(Sign sign,Store.Entry entry) {
     var plain=net.kyori.adventure.text.serializer.plain.PlainTextComponentSerializer.plainText();
     var front=sign.getSide(org.bukkit.block.sign.Side.FRONT);
-    return plain.serialize(front.line(0)).trim().equalsIgnoreCase("[WarpTarget]")
+    return targetHeader(plain.serialize(front.line(0)).trim())
         && plain.serialize(front.line(1)).trim().equalsIgnoreCase(entry.name());
   }
   @EventHandler public void countdownMove(PlayerMoveEvent event) {
@@ -917,6 +1030,9 @@ public final class WayBridge extends JavaPlugin implements Listener {
         player.sendMessage("§cTeleport cancelled: you took damage.");
       }
     }
+  }
+  @EventHandler public void migrationJoin(org.bukkit.event.player.PlayerJoinEvent event) {
+    if(migration!=null)migration.onPlayerJoin(event.getPlayer());
   }
   @EventHandler public void countdownQuit(PlayerQuitEvent event) {invalidateTeleport(event.getPlayer().getUniqueId());cancelCountdown(event.getPlayer().getUniqueId(),null);privacySelections.remove(event.getPlayer().getUniqueId());relinkSelections.remove(event.getPlayer().getUniqueId());}
   @EventHandler public void countdownDeath(PlayerDeathEvent event) {invalidateTeleport(event.getEntity().getUniqueId());cancelCountdown(event.getEntity().getUniqueId(),null);}
@@ -945,5 +1061,8 @@ public final class WayBridge extends JavaPlugin implements Listener {
   @EventHandler public void chunk(ChunkLoadEvent event){
     ChunkKey key=new ChunkKey(event.getWorld().getUID(),event.getChunk().getX(),event.getChunk().getZ());
     if(queuedRefreshChunks.add(key))pendingRefreshChunks.addLast(key);
+    // Reconcile important target updates separately from the bounded cosmetic
+    // refresh queue; this does not load any additional chunks.
+    if(!dirtyTargets.isEmpty())Bukkit.getScheduler().runTask(this,()->refreshDirtyTargetsInChunk(key));
   }
 }

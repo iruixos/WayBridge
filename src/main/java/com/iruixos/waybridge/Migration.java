@@ -72,6 +72,8 @@ final class Migration {
   private boolean scanning;
   private boolean enumerating;
   private long started;
+  private long lastConsoleProgress;
+  private long bossBarTick;
   private UUID viewer;
   private long confirmUntil;
   private UUID confirmer;
@@ -99,16 +101,16 @@ final class Migration {
     }catch(Exception ex){plugin.getLogger().warning("Legacy SignWarpX detection index unavailable: "+ex.getMessage());}
   }
   boolean isLegacySign(Sign sign){
-    if(looksLegacy(sign))return true;
-    String header=PLAIN.serialize(sign.getSide(Side.FRONT).line(0)).trim();
-    if(!header.equalsIgnoreCase("[Warp]")&&!header.equalsIgnoreCase("[WarpTarget]"))return false;
-    String name=PLAIN.serialize(sign.getSide(Side.FRONT).line(1)).trim();
-    Legacy record=legacyByName.get(name.toLowerCase(Locale.ROOT));
+    try { if(store.at(sign.getBlock().getLocation())!=null)return false; }
+    catch(SQLException ex){plugin.getLogger().warning("Unable to check sign registration during legacy detection: "+ex.getMessage());return false;}
+    return looksLegacy(sign);
+  }
+  private boolean matchesLegacyTargetPosition(Sign sign, Legacy record) {
     if(record==null)return false;
-    if(header.equalsIgnoreCase("[Warp]"))return false; // Name match alone does not prove the origin of a connecting sign.
-    Block block=sign.getBlock();
-    return block.getWorld().getName().equals(record.world())&&Math.abs(block.getX()-record.x())<=4
-        &&Math.abs(block.getY()-record.y())<=4&&Math.abs(block.getZ()-record.z())<=4;
+    Block b=sign.getBlock();
+    return b.getWorld().getName().equals(record.world())
+        && Math.abs(b.getX()-record.x())<=4 && Math.abs(b.getY()-record.y())<=4
+        && Math.abs(b.getZ()-record.z())<=4;
   }
   private void say(CommandSender sender,String message){sender.sendMessage(Component.text("[WayBridge]: ",NamedTextColor.AQUA).append(Component.text(message,NamedTextColor.WHITE)));}
   private void menuLine(CommandSender sender,String command,String description){
@@ -256,7 +258,7 @@ final class Migration {
     if(args[0].equalsIgnoreCase("status")){status(sender);wizard(sender);return;}
     if(args[0].equalsIgnoreCase("cancel")){
       enumerationCancelled.set(true);scanning=false;enumerating=false;scanGeneration++;confirmUntil=0;reviewReady=false;advanceWizard();
-      if(ticker!=null){ticker.cancel();ticker=null;}hide();queue=List.of();scanFinished=false;say(sender,"Scan cancelled. No signs modified.");wizard(sender);return;
+      if(ticker!=null){ticker.cancel();ticker=null;}if(queue!=null&&!queue.isEmpty())plugin.getLogger().info("Migration scan cancelled: "+completed+" / "+queue.size()+" chunks processed.");hide();queue=List.of();scanFinished=false;say(sender,"Scan cancelled. No signs modified.");wizard(sender);return;
     }
     if(args[0].equalsIgnoreCase("confirm")){
       if(!(sender instanceof Player p) || !p.getUniqueId().equals(confirmer) || System.currentTimeMillis()>confirmUntil){say(sender,"No pending full-scan confirmation. Use /waybridge migrate signwarpx scan all.");return;}
@@ -342,10 +344,15 @@ final class Migration {
   boolean looksLegacy(Sign sign){
     var side=sign.getSide(Side.FRONT);
     String header=PLAIN.serialize(side.line(0)).trim();
-    String third=PLAIN.serialize(side.line(2)).trim();
-    if(header.equalsIgnoreCase("[WP]")||header.equalsIgnoreCase("[WPT]"))return true;
-    if(header.equalsIgnoreCase("[WarpTarget]"))return third.toLowerCase(Locale.ROOT).startsWith("creator:");
-    if(header.equalsIgnoreCase("[Warp]"))return third.toLowerCase(Locale.ROOT).startsWith("world:");
+    String name=PLAIN.serialize(side.line(1)).trim();
+    String third=PLAIN.serialize(side.line(2)).trim().toLowerCase(Locale.ROOT);
+    // [WP] and [WPT] are also native WayBridge sign headers. Never infer
+    // legacy provenance from the header or destination name alone.
+    if(header.equalsIgnoreCase("[WPT]") || header.equalsIgnoreCase("[WarpTarget]"))
+      return third.startsWith("creator:") ||
+          matchesLegacyTargetPosition(sign,legacyByName.get(name.toLowerCase(Locale.ROOT)));
+    if(header.equalsIgnoreCase("[WP]") || header.equalsIgnoreCase("[Warp]"))
+      return third.startsWith("world:");
     return false;
   }
   private UUID resolveOwner(String creator){
@@ -360,7 +367,8 @@ final class Migration {
     say(sender,"Loaded-chunk scan complete. "+summary());
   }
   private void startFull(Player p){
-    enumerating=true;enumerationCancelled.set(false);viewer=p.getUniqueId();started=System.currentTimeMillis();
+    enumerating=true;enumerationCancelled.set(false);viewer=p.getUniqueId();started=System.currentTimeMillis();lastConsoleProgress=started;bossBarTick=0;
+    plugin.getLogger().info("Migration full-world scan: enumerating existing region chunks (initiated by "+p.getName()+").");
     final long generation=++scanGeneration;
     say(p,"Enumerating existing region-file chunks; the blue progress bar will appear when enumeration finishes.");
     // Region-file header enumeration happens off-thread. Never access Bukkit block states here.
@@ -392,14 +400,16 @@ final class Migration {
     }).whenComplete((found,error)->Bukkit.getScheduler().runTask(plugin,()->{
       if(!enumerating || generation!=scanGeneration)return;
       enumerating=false;
-      if(error!=null){say(p,"Region enumeration failed: "+error.getMessage());return;}
-      queue=found;index=0;completed=0;pending=0;inFlight.clear();scanning=true;show(p);
+      if(error!=null){say(p,"Region enumeration failed: "+error.getMessage());plugin.getLogger().warning("Migration region enumeration failed: "+error);return;}
+      queue=found;index=0;completed=0;pending=0;inFlight.clear();scanning=true;lastConsoleProgress=System.currentTimeMillis();show(p);
+      plugin.getLogger().info("Migration full-world scan started: "+queue.size()+" existing chunks across "+worlds.size()+" loaded worlds.");
       say(p,"Scanning "+queue.size()+" existing chunks. Use /waybridge migrate to view progress.");
       ticker=Bukkit.getScheduler().runTaskTimer(plugin,this::tick,1L,1L);
     }));
   }
   private void tick(){
     if(!scanning)return;
+    reportConsoleProgress(false);
     int budget=Math.max(1,Math.min(16,plugin.getConfig().getInt("migration.scan.chunks-per-tick",2)));
     int limit=Math.max(1,Math.min(32,plugin.getConfig().getInt("migration.scan.max-concurrent-chunk-loads",4)));
     final long generation=scanGeneration;
@@ -428,18 +438,23 @@ final class Migration {
       });
     }
     if(index>=queue.size()&&pending==0)finish();
-    else if(completed%Math.max(1,plugin.getConfig().getInt("migration.scan.bossbar.update-interval-ticks",20))==0)updateBar();
+    else if(++bossBarTick%Math.max(1,plugin.getConfig().getInt("migration.scan.bossbar.update-interval-ticks",20))==0)updateBar();
   }
   private void finish(){
     if(!scanning)return;
     scanning=false;scanFinished=true;advanceWizard();if(ticker!=null){ticker.cancel();ticker=null;}
     updateBar();
+    reportConsoleProgress(true);
+    plugin.getLogger().info("Migration full-world scan complete. "+summary());
     Player p=Bukkit.getPlayer(viewer);if(p!=null){say(p,"Full scan complete. "+summary());wizard(p);}
     Bukkit.getScheduler().runTaskLater(plugin,this::hide,100L);
   }
   private void inspect(Chunk chunk){
     for(org.bukkit.block.BlockState state:chunk.getTileEntities()){
       if(!(state instanceof Sign sign)||!looksLegacy(sign))continue;
+      // [WP]/[WPT] are also native WayBridge aliases; exclude existing registrations.
+      try { if(store.at(sign.getBlock().getLocation())!=null)continue; }
+      catch(SQLException ex){plugin.getLogger().warning("Could not check registered sign during migration scan: "+ex.getMessage());failures++;continue;}
       var side=sign.getSide(Side.FRONT);
       String header=PLAIN.serialize(side.line(0)).trim();
       String name=PLAIN.serialize(side.line(1)).trim();
@@ -470,13 +485,41 @@ final class Migration {
     else if(scanning)say(sender,"Scan: "+completed+" / "+queue.size()+" chunks processed, "+pending+" loading ("+(queue.isEmpty()?100:(100*completed/queue.size()))+"%).");
     else say(sender,"No scan currently running.");
   }
+  /** Restores the owner's progress display after reconnect; does not grant scan control. */
+  void onPlayerJoin(Player player){
+    if(!scanning || viewer==null || !viewer.equals(player.getUniqueId()))return;
+    if(!player.isOp() && !player.hasPermission("waybridge.admin"))return;
+    UUID id=player.getUniqueId();
+    long generation=scanGeneration;
+    Bukkit.getScheduler().runTaskLater(plugin,()->{
+      Player online=Bukkit.getPlayer(id);
+      if(online==null || !online.isOnline() || !scanning || generation!=scanGeneration || !id.equals(viewer))return;
+      if(!online.isOp() && !online.hasPermission("waybridge.admin"))return;
+      if(bar==null)show(online);
+      else online.showBossBar(bar);
+      updateBar();
+    },20L);
+  }
+  private void reportConsoleProgress(boolean force){
+    long now=System.currentTimeMillis();
+    int interval=Math.max(0,plugin.getConfig().getInt("migration.scan.console-progress-interval-seconds",60));
+    if(!force && (interval==0 || now-lastConsoleProgress < interval*1000L))return;
+    lastConsoleProgress=now;
+    int total=queue.size();
+    double percent=total==0?100.0:completed*100.0/total;
+    long elapsed=Math.max(0,(now-started)/1000);
+    plugin.getLogger().info(String.format(Locale.ROOT,
+        "Migration scan: %,d / %,d chunks (%.1f%%), %d loading, %d warnings, elapsed %dm %02ds",
+        completed,total,percent,pending,failures,elapsed/60,elapsed%60));
+  }
   private void show(Player player){
     if(!plugin.getConfig().getBoolean("migration.scan.bossbar.enabled",true))return;
     BossBar.Color color;
     try{color=BossBar.Color.valueOf(plugin.getConfig().getString("migration.scan.bossbar.color","BLUE").toUpperCase(Locale.ROOT));}
     catch(IllegalArgumentException ex){color=BossBar.Color.BLUE;}
-    bar=BossBar.bossBar(Component.text("WayBridge ",NamedTextColor.AQUA).append(Component.text("— SignWarpX Migration",NamedTextColor.DARK_PURPLE)),0f,color,BossBar.Overlay.PROGRESS);
+    if(bar==null)bar=BossBar.bossBar(Component.text("WayBridge ",NamedTextColor.AQUA).append(Component.text("— SignWarpX Migration",NamedTextColor.DARK_PURPLE)),0f,color,BossBar.Overlay.PROGRESS);
     player.showBossBar(bar);
+    updateBar();
   }
   private void updateBar(){
     if(bar==null)return;
@@ -484,7 +527,7 @@ final class Migration {
     bar.progress(progress);
     bar.name(Component.text("WayBridge ",NamedTextColor.AQUA).append(Component.text("— "+completed+" / "+queue.size()+" chunks ("+(int)(progress*100)+"%)",NamedTextColor.DARK_PURPLE)));
   }
-  private void hide(){if(bar!=null){Player p=Bukkit.getPlayer(viewer);if(p!=null)p.hideBossBar(bar);bar=null;}}
+  private void hide(){if(bar!=null){Player p=viewer==null?null:Bukkit.getPlayer(viewer);if(p!=null)p.hideBossBar(bar);bar=null;}}
   void stop(){scanGeneration++;enumerationCancelled.set(true);scanning=false;enumerating=false;if(ticker!=null)ticker.cancel();hide();}
   private void apply(CommandSender sender){
     if(scanning||enumerating){say(sender,"Wait until scanning completes before applying.");return;}
@@ -552,7 +595,9 @@ final class Migration {
         store.add(entry);
         if(candidate.kind().equals("TARGET") && (bestEffort || sourcePrivacy.getOrDefault(candidate.name().toLowerCase(Locale.ROOT),false)))store.setPrivate(entry,true);
 
-        sign.getSide(Side.FRONT).line(0,Component.text(candidate.kind().equals("TARGET")?"[WarpTarget]":"[Warp]"));
+        sign.getSide(Side.FRONT).line(0,Component.text(
+            (actualHeader.equalsIgnoreCase("[WP]")||actualHeader.equalsIgnoreCase("[WPT]"))
+                ?actualHeader:(candidate.kind().equals("TARGET")?"[WarpTarget]":"[Warp]")));
         sign.update(true,false);
         plugin.write(entry);plugin.refresh(entry.name(),effectiveOwner);
         Files.writeString(log,candidate.key()+"\tAPPLIED"+System.lineSeparator(),StandardOpenOption.APPEND);imported++;successfullyApplied.add(candidate);

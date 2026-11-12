@@ -111,6 +111,39 @@ final class Store implements AutoCloseable {
   List<Entry> all() throws SQLException {return query("SELECT * FROM signs");}
   List<Entry> links(String name, UUID owner) throws SQLException {return query("SELECT * FROM signs WHERE kind='WARP' AND name=? AND target_owner=?",name,owner.toString());}
   UUID claim(String name) throws SQLException {try(PreparedStatement p=db.prepareStatement("SELECT owner FROM claims WHERE name=?")){p.setString(1,name);try(ResultSet r=p.executeQuery()){return r.next()?UUID.fromString(r.getString(1)):null;}}}
+  record Reservation(String name, UUID owner, int linkedSigns) {}
+  Reservation reservation(String name) throws SQLException {
+    try(PreparedStatement p=db.prepareStatement(
+        "SELECT c.name,c.owner,(SELECT COUNT(*) FROM signs s WHERE s.kind='WARP' AND s.name=c.name AND s.target_owner=c.owner) AS links FROM claims c WHERE c.name=?")) {
+      p.setString(1,name);
+      try(ResultSet r=p.executeQuery()) {
+        return r.next()?new Reservation(r.getString("name"),UUID.fromString(r.getString("owner")),r.getInt("links")):null;
+      }
+    }
+  }
+  List<String> reservations() throws SQLException {
+    List<String> out=new ArrayList<>();
+    try(PreparedStatement p=db.prepareStatement("SELECT name FROM claims ORDER BY name COLLATE NOCASE");ResultSet r=p.executeQuery()) {
+      while(r.next())out.add(r.getString(1));
+    }
+    return out;
+  }
+  /** Atomic, conditional delete: never remove an active target's name or a changed claim. */
+  boolean clearReservation(String name,UUID expectedOwner,int expectedLinks) throws SQLException {
+    boolean auto=db.getAutoCommit();db.setAutoCommit(false);
+    try {
+      int changed;
+      try(PreparedStatement p=db.prepareStatement(
+          "DELETE FROM claims WHERE name=? AND owner=? " +
+          "AND NOT EXISTS (SELECT 1 FROM signs WHERE kind='TARGET' AND name=?) " +
+          "AND (SELECT COUNT(*) FROM signs WHERE kind='WARP' AND name=? AND target_owner=?)=?")) {
+        p.setString(1,name);p.setString(2,expectedOwner.toString());p.setString(3,name);
+        p.setString(4,name);p.setString(5,expectedOwner.toString());p.setInt(6,expectedLinks);
+        changed=p.executeUpdate();
+      }
+      db.commit();return changed==1;
+    }catch(SQLException ex){db.rollback();throw ex;}finally{db.setAutoCommit(auto);}
+  }
   void add(Entry e) throws SQLException { add(e,false); }
   void add(Entry e,boolean privateTarget) throws SQLException {
     boolean auto=db.getAutoCommit();db.setAutoCommit(false);

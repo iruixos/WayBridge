@@ -38,6 +38,9 @@ migration:
     chunks-per-tick: 2
     # Upper bound on outstanding async chunk-load requests.
     max-concurrent-chunk-loads: 4
+    # Log ongoing full-world scan progress to the normal Paper console/latest.log.
+    # 0 disables periodic updates; start, completion and cancellation are still logged.
+    console-progress-interval-seconds: 60
     bossbar:
       enabled: true
       color: BLUE

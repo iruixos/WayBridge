@@ -18,7 +18,7 @@ import java.util.UUID;
 final class WayBridgeTabCompleter implements TabCompleter {
   private static final List<String> BASE = List.of(
       "help", "list", "inspect", "private", "public", "relink", "invite", "uninvite", "invites");
-  private static final List<String> ADMIN = List.of("reload", "migrate");
+  private static final List<String> ADMIN = List.of("reload", "migrate", "reservation");
   private static final List<String> MIGRATION = List.of(
       "rollback", "select", "signwarpx", "back", "reset", "next", "previous", "status", "cancel", "confirm");
   private final Store store;
@@ -34,6 +34,16 @@ final class WayBridgeTabCompleter implements TabCompleter {
     }
     String action = args[0].toLowerCase(Locale.ROOT);
     if (action.equals("help") && args.length == 2) return matches(List.of("1", "2"), args[1]);
+    if (action.equals("reservation")) {
+      if (!sender.hasPermission("waybridge.admin")) return List.of();
+      if (args.length == 2) return matches(List.of("info", "clear", "confirm"),args[1]);
+      if ((args[1].equalsIgnoreCase("info")||args[1].equalsIgnoreCase("clear")) && args.length >= 3) {
+        try { return matches(store.reservations(),String.join(" ",java.util.Arrays.copyOfRange(args,2,args.length))); }
+        catch(SQLException ex){return List.of();}
+      }
+      // Confirmation tokens are presented only in the interactive preview.
+      return List.of();
+    }
     if (action.equals("migrate")) {
       if (!sender.hasPermission("waybridge.admin")) return List.of();
       if (args.length == 2) return matches(MIGRATION, args[1]);
