@@ -1,0 +1,20 @@
+name: WayBridge
+version: 1.0.0
+main: com.iruixos.waybridge.WayBridge
+api-version: '26.3'
+author: iruixos
+description: Protected sign-based travel with persistent targets and links.
+softdepend: [WorldGuard]
+commands:
+  waybridge:
+    description: WayBridge information and administration
+    usage: /waybridge [help|list|inspect|private|public|invite|uninvite|invites|relink|reload|migrate]
+permissions:
+  waybridge.create.target:
+    default: true
+  waybridge.create.warp:
+    default: true
+  waybridge.use:
+    default: true
+  waybridge.admin:
+    default: op

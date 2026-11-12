@@ -1,0 +1,53 @@
+# Warp names are globally unique and case-insensitive.
+max-name-length: 16
+teleport-cooldown-seconds: 3
+teleport:
+  countdown:
+    enabled: true
+    seconds: 5
+    cancel-on-movement: true
+    cancel-on-damage: true
+    show-title: true
+    show-actionbar: true
+    click-sound:
+      enabled: true
+      sound: minecraft:block.stone_button.click_on
+      volume: 0.7
+      pitch: 1.2
+# If WorldGuard is present, require its build permission at sign locations.
+respect-worldguard: true
+# Operator and waybridge.admin may remove other players' signs, but cannot edit them.
+
+# Sounds and particles are server-side and only play in loaded chunks.
+effects:
+  enabled: true
+  failure: {sound: BLOCK_NOTE_BLOCK_BASS, volume: 0.9, pitch: 0.6, particle: SMOKE, count: 10}
+  target-created: {sound: BLOCK_AMETHYST_BLOCK_CHIME, volume: 0.8, pitch: 1.0, particle: END_ROD, count: 12}
+  link-created: {sound: ENTITY_EXPERIENCE_ORB_PICKUP, volume: 0.8, pitch: 1.3, particle: HAPPY_VILLAGER, count: 18}
+  linked-target: {sound: BLOCK_AMETHYST_BLOCK_CHIME, volume: 0.6, pitch: 1.4, particle: HAPPY_VILLAGER, count: 12}
+  unlinked: {sound: BLOCK_BEACON_DEACTIVATE, volume: 0.7, pitch: 1.2, particle: SMOKE, count: 12}
+
+  # Enderman-style teleport effects, played only after a successful teleport.
+  teleport-departure: {sound: ENTITY_ENDERMAN_TELEPORT, volume: 0.9, pitch: 1.0, particle: PORTAL, count: 45}
+  teleport-arrival: {sound: ENTITY_ENDERMAN_TELEPORT, volume: 0.9, pitch: 1.1, particle: PORTAL, count: 45}
+
+# Migration from SignWarpX (administrators only).
+migration:
+  signwarpx-database: plugins/SignWarpX/database/data.db
+  scan:
+    chunks-per-tick: 2
+    # Upper bound on outstanding async chunk-load requests.
+    max-concurrent-chunk-loads: 4
+    bossbar:
+      enabled: true
+      color: BLUE
+      update-interval-ticks: 20
+
+# Defer database sign reconciliation to avoid join/chunk-load spikes.
+performance:
+  chunk-lookups-per-tick: 1
+  sign-refreshes-per-tick: 4
+  max-pending-signs: 4096
+  # Every 60 seconds, write aggregated DB/refresh timings to logs/WayBridge/diagnostics-0.log.
+  # Rotates three files (2 MiB each); enable/disable requires a restart.
+  diagnostics: false
