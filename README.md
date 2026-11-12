@@ -6,6 +6,11 @@
 
 **Requirements:** Paper 26.3 · Java 25 · Optional WorldGuard integration · Maven for building from source.
 
+> [!IMPORTANT]
+> DISCLAIMER: This is directly inspired by the SignWarpX plugin, however it does NOT use any source code from that project.
+> WayBridge is not intended to infringe upon anyone's intellectual property, and is not intended to be used commercially.
+> For concerns, please contact me at **iruixos (at) pm (dot) me**
+
 ## Features
 
 - **Sign-based travel:** `[WarpTarget]` destinations and multiple `[Warp]` links per target.
