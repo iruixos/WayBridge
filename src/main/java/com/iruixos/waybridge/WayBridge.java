@@ -61,6 +61,7 @@ import java.util.Deque;
 import java.util.HashSet;
 import java.util.Arrays;
 import java.util.Collection;
+import java.util.concurrent.CompletableFuture;
 import java.util.Comparator;
 import java.util.EnumSet;
 import java.util.HashMap;
@@ -91,6 +92,7 @@ public final class WayBridge extends JavaPlugin implements Listener {
   private long lastQueueWarning;
   private Store store;
   private Migration migration;
+  private Repair repair;
   private final Map<UUID, PendingTeleport> pendingTeleports = new HashMap<>();
   // A player has at most one countdown/chunk-load/teleport operation in flight.
   // Generation tokens invalidate callbacks after disconnect, death or replacement.
@@ -172,6 +174,7 @@ public final class WayBridge extends JavaPlugin implements Listener {
     refreshWorker=Bukkit.getScheduler().runTaskTimer(this,this::processRefreshQueue,1L,1L);
     diagnosticWorker=Bukkit.getScheduler().runTaskTimer(this,this::logPerformance,1200L,1200L);
     migration=new Migration(this,store);
+    repair=new Repair(this,store);
     Objects.requireNonNull(getCommand("waybridge")).setExecutor((sender,cmd,label,args)->{
       if(args.length==0||args[0].equalsIgnoreCase("help")) {
         int page=1;
@@ -213,6 +216,10 @@ public final class WayBridge extends JavaPlugin implements Listener {
           }
         }catch(SQLException ex){error(ex);p.sendMessage("§cCould not update invitations.");}
         return true;
+      }
+      if(args[0].equalsIgnoreCase("repair")) {
+        if(!sender.hasPermission("waybridge.admin")){sender.sendMessage("§cAdministrator permission required.");return true;}
+        repair.command(sender,java.util.Arrays.copyOfRange(args,1,args.length));return true;
       }
       if(args[0].equalsIgnoreCase("reservation")) {
         reservationCommand(sender,args);return true;
@@ -285,6 +292,7 @@ public final class WayBridge extends JavaPlugin implements Listener {
       helpLine(sender,"/waybridge invite <target> <player>","Grant private access");
       helpLine(sender,"/waybridge uninvite <target> <player>","Revoke private access");
       helpLine(sender,"/waybridge invites <target>","List invited players");
+      if(sender.hasPermission("waybridge.admin"))helpLine(sender,"/waybridge repair scan | list | cleanup","Review and safely remove missing sign registrations (admin)");
       if(sender.hasPermission("waybridge.admin"))helpLine(sender,"/waybridge reservation info <name>","Inspect a name reservation (admin)");
       if(sender.hasPermission("waybridge.admin"))helpLine(sender,"/waybridge reservation clear <name>","Safely clear a name reservation with confirmation (admin)");
       if(sender.hasPermission("waybridge.admin"))helpLine(sender,"/waybridge reload","Reload configuration (admin)");
@@ -333,7 +341,7 @@ public final class WayBridge extends JavaPlugin implements Listener {
       getLogger().warning("Could not count registered signs: " + ex.getMessage());
     }
   }
-  @Override public void onDisable(){if(refreshWorker!=null)refreshWorker.cancel();if(diagnosticWorker!=null)diagnosticWorker.cancel();pendingRefreshChunks.clear();queuedRefreshChunks.clear();pendingSignRefreshes.clear();dirtyTargets.clear();activeTeleports.clear();teleportOrigins.clear();waybridgeTeleportEvents.clear();for(UUID id:new ArrayList<>(pendingTeleports.keySet())) cancelCountdown(id,null);privacySelections.clear();relinkSelections.clear();pendingReservations.clear();if(migration!=null)migration.stop();if(store!=null)try{store.close();}catch(Exception e){getLogger().warning(e.toString());}closeDiagnosticLogging();}
+  @Override public void onDisable(){if(repair!=null)repair.clear();if(refreshWorker!=null)refreshWorker.cancel();if(diagnosticWorker!=null)diagnosticWorker.cancel();pendingRefreshChunks.clear();queuedRefreshChunks.clear();pendingSignRefreshes.clear();dirtyTargets.clear();activeTeleports.clear();teleportOrigins.clear();waybridgeTeleportEvents.clear();for(UUID id:new ArrayList<>(pendingTeleports.keySet())) cancelCountdown(id,null);privacySelections.clear();relinkSelections.clear();pendingReservations.clear();if(migration!=null)migration.stop();if(store!=null)try{store.close();}catch(Exception e){getLogger().warning(e.toString());}closeDiagnosticLogging();}
   private void error(Exception ex){getLogger().severe("Database error: "+ex);}
   private boolean admin(Player p){return p.isOp()||p.hasPermission("waybridge.admin");}
   private boolean region(Player p,Location l){
@@ -564,34 +572,190 @@ public final class WayBridge extends JavaPlugin implements Listener {
       b.getWorld().dropItemNaturally(dropLocation,drop);
 
   }
+  // Locate the nearest safe standing spot, allowing arrival below elevated/hanging signs.
+  // Candidate chunks are loaded asynchronously before this method is called; this method
+  // never synchronously loads a chunk while checking blocks or hazards.
   private Location safeArrival(Location signLoc) {
-    Block block=signLoc.getBlock();
-    if(!(block.getState() instanceof Sign))return null;
-    org.bukkit.block.BlockFace facing=org.bukkit.block.BlockFace.NORTH;
-    if(block.getBlockData() instanceof WallSign wall)facing=wall.getFacing();
-    else if(block.getBlockData() instanceof org.bukkit.block.data.type.Sign standing)
-      facing=standing.getRotation();
-    // Check in front of the sign first; then adjacent alternatives. Never place
-    // the player inside the sign block or its supporting wall/tree.
-    List<org.bukkit.block.BlockFace> faces=new ArrayList<>();faces.add(facing);
-    for(var face:List.of(org.bukkit.block.BlockFace.NORTH,org.bukkit.block.BlockFace.EAST,
-        org.bukkit.block.BlockFace.SOUTH,org.bukkit.block.BlockFace.WEST))if(!faces.contains(face))faces.add(face);
-    for(var face:faces)for(int distance=1;distance<=2;distance++)for(int dy=0;dy>=-2;dy--){
-      int fx=block.getX()+face.getModX()*distance;
-      int fz=block.getZ()+face.getModZ()*distance;
-      // Never synchronously load a neighboring chunk during safe-arrival checks.
-      if(!block.getWorld().isChunkLoaded(fx >> 4,fz >> 4))continue;
-      Block feet=block.getWorld().getBlockAt(fx,block.getY()+dy,fz);
-      Block head=feet.getRelative(org.bukkit.block.BlockFace.UP);
-      Block ground=feet.getRelative(org.bukkit.block.BlockFace.DOWN);
-      if(feet.getY()<=block.getWorld().getMinHeight()||head.getY()>=block.getWorld().getMaxHeight())continue;
-      if(!feet.isPassable()||!head.isPassable()||feet.isLiquid()||head.isLiquid()||
-          ground.isPassable()||ground.isLiquid())continue;
-      Location arrival=feet.getLocation().add(0.5,0,0.5);
+    World world = signLoc.getWorld();
+    int horizontal = Math.max(1, Math.min(8, getConfig().getInt("teleport.safe-arrival.horizontal-radius", 5)));
+    int vertical = Math.max(1, Math.min(16, getConfig().getInt("teleport.safe-arrival.vertical-radius", 8)));
+    int sx = signLoc.getBlockX(), sy = signLoc.getBlockY(), sz = signLoc.getBlockZ();
+    List<int[]> candidates = new ArrayList<>();
+    for (int dx = -horizontal; dx <= horizontal; dx++)
+      for (int dz = -horizontal; dz <= horizontal; dz++) {
+        if (dx*dx + dz*dz > horizontal*horizontal) continue;
+        for (int dy = -vertical; dy <= vertical; dy++) {
+          int y = sy + dy;
+          if (y <= world.getMinHeight() || y + 1 >= world.getMaxHeight()) continue;
+          candidates.add(new int[]{sx+dx, y, sz+dz, dx, dy, dz});
+        }
+      }
+    // Closest feasible arrival wins, with a small preference for horizontal proximity
+    // and the player's preferred arrival facing (determined after selection).
+    candidates.sort(Comparator.comparingDouble(c ->
+        c[3]*c[3] + c[5]*c[5] + 0.20*c[4]*c[4]));
+    for (int[] c : candidates) {
+      int x = c[0], y = c[1], z = c[2];
+      if (!world.isChunkLoaded(x >> 4, z >> 4)) continue;
+      Block feet = world.getBlockAt(x, y, z);
+      Block head = feet.getRelative(org.bukkit.block.BlockFace.UP);
+      Block ground = feet.getRelative(org.bukkit.block.BlockFace.DOWN);
+      if (!safeStandingSpot(feet, head, ground)) continue;
+      // A ledge or a hanging sign support is not a safe place to arrive.
+      if (!stableLandingArea(feet, ground)) continue;
+      Location arrival = new Location(world, x + 0.5, y, z + 0.5);
       orientTowardSign(arrival, signLoc);
       return arrival;
     }
     return null;
+  }
+
+  // Validate the player-sized standing column rather than relying on passability alone.
+  // A full collision-free 2-block column and a single full-height support surface are
+  // conservative: slabs, stairs, open trapdoors and thin ledges are not considered safe.
+  private boolean safeStandingSpot(Block feet, Block head, Block ground) {
+    if (!safeBasicStandingSpot(feet, head, ground)) return false;
+    // Reject adjacent contact hazards, including waterlogged neighbours.
+    for (org.bukkit.block.BlockFace face : List.of(org.bukkit.block.BlockFace.NORTH,
+        org.bukkit.block.BlockFace.SOUTH, org.bukkit.block.BlockFace.EAST,
+        org.bukkit.block.BlockFace.WEST)) {
+      for (Block neighbor : List.of(feet.getRelative(face), head.getRelative(face))) {
+        if (!neighbor.getWorld().isChunkLoaded(neighbor.getX() >> 4, neighbor.getZ() >> 4)) return false;
+        if (dangerousArrivalBlock(neighbor.getType()) || isWaterlogged(neighbor)) return false;
+      }
+    }
+    return true;
+  }
+
+  private boolean withinArrivalBorder(Block feet) {
+    // Keep both the player's body and the four corners of its occupied square inside
+    // the world border. WorldBorder#isInside works with absolute world coordinates.
+    World world = feet.getWorld();
+    int x = feet.getX(), y = feet.getY(), z = feet.getZ();
+    for (double dx : new double[]{0.20, 0.80})
+      for (double dz : new double[]{0.20, 0.80})
+        if (!world.getWorldBorder().isInside(new Location(world, x + dx, y, z + dz))) return false;
+    return true;
+  }
+
+  private boolean isWaterlogged(Block block) {
+    return block.getBlockData() instanceof org.bukkit.block.data.Waterlogged waterlogged
+        && waterlogged.isWaterlogged();
+  }
+
+  // Reject landing on the thin support directly over a hanging sign, and ensure
+  // the player has a genuinely usable 2x2 standing footprint rather than a
+  // precarious single-block outcrop on a cliff face. The neighboring positions
+  // must be in already-loaded chunks; arrival checks never force chunk loads.
+  private boolean stableLandingArea(Block feet, Block ground) {
+    if (hangingSignBelow(ground)) return false;
+    org.bukkit.block.BlockFace[] cardinals = {
+        org.bukkit.block.BlockFace.NORTH, org.bukkit.block.BlockFace.EAST,
+        org.bukkit.block.BlockFace.SOUTH, org.bukkit.block.BlockFace.WEST};
+    boolean[] safeSide = new boolean[4];
+    for (int i = 0; i < cardinals.length; i++) {
+      Block neighborFeet = feet.getRelative(cardinals[i]);
+      if (!neighborFeet.getWorld().isChunkLoaded(neighborFeet.getX() >> 4, neighborFeet.getZ() >> 4))
+        continue;
+      Block neighborGround = neighborFeet.getRelative(org.bukkit.block.BlockFace.DOWN);
+      Block neighborHead = neighborFeet.getRelative(org.bukkit.block.BlockFace.UP);
+      if (!neighborHead.getWorld().isChunkLoaded(neighborHead.getX() >> 4, neighborHead.getZ() >> 4))
+        continue;
+      safeSide[i] = safeBasicStandingSpot(neighborFeet, neighborHead, neighborGround)
+          && !hangingSignBelow(neighborGround);
+    }
+    // Two adjacent safe neighbors guarantee at least an L-shaped footprint;
+    // a narrow one-block-wide ledge cannot qualify. Also require the diagonal
+    // corner to complete an actual 2x2 floor, not just two disconnected arms.
+    for (int i = 0; i < 4; i++) {
+      int next = (i + 1) % 4;
+      if (!safeSide[i] || !safeSide[next]) continue;
+      Block diagonal = feet.getRelative(cardinals[i]).getRelative(cardinals[next]);
+      if (!diagonal.getWorld().isChunkLoaded(diagonal.getX() >> 4, diagonal.getZ() >> 4)) continue;
+      if (safeBasicStandingSpot(diagonal,
+          diagonal.getRelative(org.bukkit.block.BlockFace.UP),
+          diagonal.getRelative(org.bukkit.block.BlockFace.DOWN))
+          && !hangingSignBelow(diagonal.getRelative(org.bukkit.block.BlockFace.DOWN))) return true;
+    }
+    return false;
+  }
+
+  private boolean safeBasicStandingSpot(Block feet, Block head, Block ground) {
+    if (!withinArrivalBorder(feet)) return false;
+    if (!ground.getType().isSolid() || ground.isLiquid() || isWaterlogged(ground)) return false;
+    if (dangerousArrivalBlock(ground.getType()) || dangerousArrivalBlock(feet.getType())
+        || dangerousArrivalBlock(head.getType())) return false;
+    if (feet.isLiquid() || head.isLiquid() || isWaterlogged(feet) || isWaterlogged(head)) return false;
+    // Passable doesn't imply an empty collision shape (e.g. decorative/interactive blocks).
+    // Reject any shape in the occupied feet or head blocks; this also keeps the
+    // destination safe for the full 1.8-block-tall player, not just their feet.
+    if (!feet.getCollisionShape().getBoundingBoxes().isEmpty()
+        || !head.getCollisionShape().getBoundingBoxes().isEmpty()) return false;
+    if (!feet.isPassable() || !head.isPassable()) return false;
+    // Require a continuous, full-height supporting surface. A collision shape made
+    // from multiple partial boxes (stairs etc.) is not reliable standing ground.
+    var shapes = ground.getCollisionShape().getBoundingBoxes();
+    if (shapes.size() != 1) return false;
+    var bounds = ground.getBoundingBox();
+    double epsilon = 1.0e-4;
+    return bounds.getMaxY() >= feet.getY() - epsilon
+        && bounds.getMinX() <= ground.getX() + 0.20 + epsilon
+        && bounds.getMaxX() >= ground.getX() + 0.80 - epsilon
+        && bounds.getMinZ() <= ground.getZ() + 0.20 + epsilon
+        && bounds.getMaxZ() >= ground.getZ() + 0.80 - epsilon;
+  }
+
+  private boolean arrivalStillSafe(Location arrival) {
+    if (arrival == null || arrival.getWorld() == null) return false;
+    World world = arrival.getWorld();
+    int x = arrival.getBlockX(), z = arrival.getBlockZ();
+    if (!world.isChunkLoaded(x >> 4, z >> 4)) return false;
+    Block feet = world.getBlockAt(x, arrival.getBlockY(), z);
+    Block head = feet.getRelative(org.bukkit.block.BlockFace.UP);
+    Block ground = feet.getRelative(org.bukkit.block.BlockFace.DOWN);
+    return safeStandingSpot(feet, head, ground) && stableLandingArea(feet, ground);
+  }
+
+  private boolean hangingSignBelow(Block ground) {
+    Block below = ground.getRelative(org.bukkit.block.BlockFace.DOWN);
+    return below.getBlockData() instanceof org.bukkit.block.data.type.HangingSign;
+  }
+
+  private static boolean dangerousArrivalBlock(Material type) {
+    String name = type.name();
+    return name.equals("LAVA") || name.equals("FIRE") || name.equals("SOUL_FIRE")
+        || name.equals("MAGMA_BLOCK") || name.equals("CACTUS")
+        || name.equals("CAMPFIRE") || name.equals("SOUL_CAMPFIRE")
+        || name.equals("POWDER_SNOW") || name.equals("SWEET_BERRY_BUSH")
+        || name.equals("WITHER_ROSE") || name.equals("NETHER_PORTAL")
+        || name.equals("END_PORTAL") || name.equals("END_GATEWAY")
+        || name.equals("POINTED_DRIPSTONE") || name.equals("COBWEB")
+        || name.equals("VOID_AIR") || name.equals("BUBBLE_COLUMN")
+        || name.equals("WATER") || name.equals("LAVA")
+        || name.endsWith("_FENCE") || name.endsWith("_WALL")
+        || name.endsWith("_FENCE_GATE");
+  }
+
+  // Load the modest footprint around the destination without blocking the tick thread.
+  // A failed neighboring chunk does not prevent selecting a safe loaded alternative.
+  private CompletableFuture<Void> loadArrivalChunks(Location target) {
+    World world = target.getWorld();
+    int radius = Math.max(1, Math.min(8, getConfig().getInt("teleport.safe-arrival.horizontal-radius", 5)));
+    int minX = (target.getBlockX() - radius - 1) >> 4;
+    int maxX = (target.getBlockX() + radius + 1) >> 4;
+    int minZ = (target.getBlockZ() - radius - 1) >> 4;
+    int maxZ = (target.getBlockZ() + radius + 1) >> 4;
+    List<CompletableFuture<?>> futures = new ArrayList<>();
+    for (int cx=minX; cx<=maxX; cx++) for (int cz=minZ; cz<=maxZ; cz++) {
+      if (world.isChunkLoaded(cx, cz)) continue;
+      futures.add(world.getChunkAtAsync(cx, cz, false).handle((chunk, error) -> {
+        if (error != null) getLogger().warning("Unable to load nearby warp-arrival chunk: " + error);
+        // A null result means the chunk is not generated; do not create new terrain.
+        // The candidate search skips chunks that remain unloaded.
+        return null;
+      }));
+    }
+    return CompletableFuture.allOf(futures.toArray(new CompletableFuture<?>[0]));
   }
   // Location#setDirection expects a direction from the camera (eyes), not the feet.
   // Aim at the visible face of a wall sign rather than the centre of its supporting block.
@@ -673,7 +837,40 @@ public final class WayBridge extends JavaPlugin implements Listener {
       }catch(SQLException ex){error(ex);p.sendMessage("§cRegistration failed; check server logs.");}
     });
   }
-  @EventHandler(priority=EventPriority.LOWEST) public void protectBreak(BlockBreakEvent event){Store.Entry e=at(event.getBlock());if(e==null)return;Player p=event.getPlayer();if((!e.owner().equals(p.getUniqueId())&&!admin(p)&&!(e.kind().equals("WARP")&&isTargetOwner(e,p)))||!region(p,event.getBlock().getLocation())){event.setCancelled(true);p.sendMessage("§cThis WayBridge sign is protected.");}}
+  // A player can break an adjacent supporting block without directly breaking a sign.
+  // Protect the support regardless of sign ownership: remove the sign directly
+  // first so the existing ownership checks and deregistration path always run.
+  private boolean supportsRegisteredSign(Block support) {
+    for(org.bukkit.block.BlockFace face : new org.bukkit.block.BlockFace[]{
+        org.bukkit.block.BlockFace.UP,org.bukkit.block.BlockFace.DOWN,
+        org.bukkit.block.BlockFace.NORTH,org.bukkit.block.BlockFace.SOUTH,
+        org.bukkit.block.BlockFace.EAST,org.bukkit.block.BlockFace.WEST}) {
+      Block neighbor=support.getRelative(face);
+      if(!signMaterial(neighbor.getType()) || !attachedTo(neighbor,support))continue;
+      // Fail closed on a failed SQLite lookup, like the public sign-protection API.
+      if(isRegisteredSign(neighbor))return true;
+    }
+    return false;
+  }
+  private boolean attachedTo(Block signBlock,Block support) {
+    var data=signBlock.getBlockData();
+    String type=signBlock.getType().name();
+    if(type.contains("WALL_") && data instanceof org.bukkit.block.data.Directional directional)
+      return signBlock.getRelative(directional.getFacing().getOppositeFace()).equals(support);
+    if(type.contains("HANGING_SIGN") && !type.contains("WALL_"))
+      return signBlock.getRelative(org.bukkit.block.BlockFace.UP).equals(support);
+    if(type.endsWith("_SIGN") && !type.contains("WALL_") && !type.contains("HANGING_"))
+      return signBlock.getRelative(org.bukkit.block.BlockFace.DOWN).equals(support);
+    return false;
+  }
+  @EventHandler(priority=EventPriority.LOWEST) public void protectBreak(BlockBreakEvent event){
+    if(supportsRegisteredSign(event.getBlock())) {
+      event.setCancelled(true);
+      event.getPlayer().sendMessage("§cThis block supports a registered WayBridge sign. Remove the sign directly first.");
+      return;
+    }
+    Store.Entry e=at(event.getBlock());if(e==null)return;Player p=event.getPlayer();if((!e.owner().equals(p.getUniqueId())&&!admin(p)&&!(e.kind().equals("WARP")&&isTargetOwner(e,p)))||!region(p,event.getBlock().getLocation())){event.setCancelled(true);p.sendMessage("§cThis WayBridge sign is protected.");}
+  }
   private boolean isTargetOwner(Store.Entry warp,Player p){
     try{Store.Entry target=store.target(warp.name());return target!=null&&store.validLink(warp,target)&&target.owner().equals(p.getUniqueId());}
     catch(SQLException ex){error(ex);return false;}
@@ -945,12 +1142,12 @@ public final class WayBridge extends JavaPlugin implements Listener {
       activeTeleports.put(playerId,token);
       teleportOrigins.put(playerId,player.getLocation().clone());
       // All Bukkit/SQLite access happens on the server thread, not in the future callback.
-      location.getWorld().getChunkAtAsync(location.getBlockX() >> 4, location.getBlockZ() >> 4, true)
-          .whenComplete((chunk, loadError) -> {
+      loadArrivalChunks(location)
+          .whenComplete((ignored, loadError) -> {
             if(!isEnabled())return;
             Bukkit.getScheduler().runTask(this, () -> {
               if(!currentTeleport(player,token))return;
-              if(loadError!=null||chunk==null){
+              if(loadError!=null || !location.getWorld().isChunkLoaded(location.getBlockX() >> 4, location.getBlockZ() >> 4)){
                 getLogger().warning("Could not load destination chunk for warp '"+name+"': "+loadError);
                 failTeleport(player,token,"§cCould not load the destination chunk.");return;
               }
@@ -974,8 +1171,26 @@ public final class WayBridge extends JavaPlugin implements Listener {
                 }
                 Location arrival=safeArrival(location);
                 if(arrival==null){
-                  failTeleport(player,token,"§cTarget arrival is obstructed or its surrounding chunk is unloaded.");
+                  failTeleport(player,token,"§cNo safe arrival location was found near this WarpTarget.");
                   effect(player.getLocation(),"failure");return;
+                }
+                // Final synchronous check, directly before submitting teleportAsync.
+                // The target, its UUID, permissions and standing blocks can change
+                // while candidate chunks load. This does not claim to prevent changes
+                // made externally after Paper has accepted the async teleport request.
+                Store.Entry finalTarget=store.target(name);
+                if(finalTarget==null || !finalTarget.equals(target)
+                    || !targetId.equals(store.targetId(finalTarget))
+                    || !(location.getBlock().getState() instanceof Sign finalSign)
+                    || !matchesRegisteredSign(finalSign,finalTarget)) {
+                  failTeleport(player,token,"§cThis warp's target has changed or is missing.");return;
+                }
+                if(!player.hasPermission("waybridge.use")
+                    || (!store.allowed(finalTarget,playerId) && !admin(player))) {
+                  failTeleport(player,token,"§cYou no longer have permission to use this WarpTarget.");return;
+                }
+                if (!arrivalStillSafe(arrival)) {
+                  failTeleport(player,token,"§cThe safe arrival area has changed. Teleport cancelled.");return;
                 }
                 orientTowardSign(arrival,location);
                 Location departure=player.getLocation().clone();
@@ -1046,10 +1261,10 @@ public final class WayBridge extends JavaPlugin implements Listener {
         && !waybridgeTeleportEvents.contains(event.getPlayer().getUniqueId()))
       invalidateTeleport(event.getPlayer().getUniqueId());
   }
-  @EventHandler(ignoreCancelled=true) public void explode(BlockExplodeEvent event){event.blockList().removeIf(b->at(b)!=null);}
-  @EventHandler(ignoreCancelled=true) public void entityExplode(org.bukkit.event.entity.EntityExplodeEvent event){event.blockList().removeIf(b->at(b)!=null);}
-  @EventHandler(ignoreCancelled=true) public void piston(BlockPistonExtendEvent event){if(event.getBlocks().stream().anyMatch(b->at(b)!=null))event.setCancelled(true);}
-  @EventHandler(ignoreCancelled=true) public void pistonRetract(BlockPistonRetractEvent event){if(event.getBlocks().stream().anyMatch(b->at(b)!=null))event.setCancelled(true);}
+  @EventHandler(ignoreCancelled=true) public void explode(BlockExplodeEvent event){event.blockList().removeIf(b->at(b)!=null||supportsRegisteredSign(b));}
+  @EventHandler(ignoreCancelled=true) public void entityExplode(org.bukkit.event.entity.EntityExplodeEvent event){event.blockList().removeIf(b->at(b)!=null||supportsRegisteredSign(b));}
+  @EventHandler(ignoreCancelled=true) public void piston(BlockPistonExtendEvent event){if(event.getBlocks().stream().anyMatch(b->at(b)!=null||supportsRegisteredSign(b)))event.setCancelled(true);}
+  @EventHandler(ignoreCancelled=true) public void pistonRetract(BlockPistonRetractEvent event){if(event.getBlocks().stream().anyMatch(b->at(b)!=null||supportsRegisteredSign(b)))event.setCancelled(true);}
   @EventHandler(ignoreCancelled=true) public void physics(BlockPhysicsEvent event){
     // The overwhelming majority of physics events are not signs; never query
     // SQLite for them. Wall and hanging signs remain protected.

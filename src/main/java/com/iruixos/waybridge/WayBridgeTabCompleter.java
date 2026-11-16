@@ -18,7 +18,7 @@ import java.util.UUID;
 final class WayBridgeTabCompleter implements TabCompleter {
   private static final List<String> BASE = List.of(
       "help", "list", "inspect", "private", "public", "relink", "invite", "uninvite", "invites");
-  private static final List<String> ADMIN = List.of("reload", "migrate", "reservation");
+  private static final List<String> ADMIN = List.of("reload", "migrate", "reservation", "repair");
   private static final List<String> MIGRATION = List.of(
       "rollback", "select", "signwarpx", "back", "reset", "next", "previous", "status", "cancel", "confirm");
   private final Store store;
@@ -34,6 +34,10 @@ final class WayBridgeTabCompleter implements TabCompleter {
     }
     String action = args[0].toLowerCase(Locale.ROOT);
     if (action.equals("help") && args.length == 2) return matches(List.of("1", "2"), args[1]);
+    if (action.equals("repair")) {
+      if(!sender.hasPermission("waybridge.admin"))return List.of();
+      return args.length==2?matches(List.of("scan","list","cleanup"),args[1]):List.of();
+    }
     if (action.equals("reservation")) {
       if (!sender.hasPermission("waybridge.admin")) return List.of();
       if (args.length == 2) return matches(List.of("info", "clear", "confirm"),args[1]);

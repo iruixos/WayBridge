@@ -2,6 +2,11 @@
 max-name-length: 16
 teleport-cooldown-seconds: 3
 teleport:
+  # Search around and below elevated targets for a safe 2-block-tall standing spot.
+  # Limits: horizontal 1–8 blocks, vertical 1–16 blocks.
+  safe-arrival:
+    horizontal-radius: 5
+    vertical-radius: 8
   countdown:
     enabled: true
     seconds: 5
