@@ -582,11 +582,19 @@ public final class WayBridge extends JavaPlugin implements Listener {
       b.getWorld().dropItemNaturally(dropLocation,drop);
 
   }
+  // WayBridge does not provide access to the roof of a Nether dimension. Keep this
+  // rule independent of the general collision and landing-area checks: bedrock
+  // roof locations can otherwise appear perfectly safe to stand on.
+  private static boolean netherRoof(World world, int feetY) {
+    return world != null && world.getEnvironment() == World.Environment.NETHER && feetY >= 128;
+  }
+
   // Locate the nearest safe standing spot, allowing arrival below elevated/hanging signs.
   // Candidate chunks are loaded asynchronously before this method is called; this method
   // never synchronously loads a chunk while checking blocks or hazards.
   private Location safeArrival(Location signLoc) {
     World world = signLoc.getWorld();
+    if (netherRoof(world, signLoc.getBlockY())) return null;
     int horizontal = Math.max(1, Math.min(8, getConfig().getInt("teleport.safe-arrival.horizontal-radius", 5)));
     int vertical = Math.max(1, Math.min(16, getConfig().getInt("teleport.safe-arrival.vertical-radius", 8)));
     int sx = signLoc.getBlockX(), sy = signLoc.getBlockY(), sz = signLoc.getBlockZ();
@@ -596,7 +604,8 @@ public final class WayBridge extends JavaPlugin implements Listener {
         if (dx*dx + dz*dz > horizontal*horizontal) continue;
         for (int dy = -vertical; dy <= vertical; dy++) {
           int y = sy + dy;
-          if (y <= world.getMinHeight() || y + 1 >= world.getMaxHeight()) continue;
+          if (y <= world.getMinHeight() || y + 1 >= world.getMaxHeight()
+              || netherRoof(world, y)) continue;
           candidates.add(new int[]{sx+dx, y, sz+dz, dx, dy, dz});
         }
       }
@@ -718,6 +727,7 @@ public final class WayBridge extends JavaPlugin implements Listener {
   private boolean arrivalStillSafe(Location arrival) {
     if (arrival == null || arrival.getWorld() == null) return false;
     World world = arrival.getWorld();
+    if (netherRoof(world, arrival.getBlockY())) return false;
     int x = arrival.getBlockX(), z = arrival.getBlockZ();
     if (!world.isChunkLoaded(x >> 4, z >> 4)) return false;
     Block feet = world.getBlockAt(x, arrival.getBlockY(), z);
@@ -831,6 +841,10 @@ public final class WayBridge extends JavaPlugin implements Listener {
       Block b=event.getBlock();if(!(b.getState() instanceof Sign sign))return;
       try {
         if(store.at(b.getLocation())!=null)return;
+        if (target && netherRoof(b.getWorld(), b.getY())) {
+          rejectWarp(b, p, "WarpTargets cannot be registered above the Nether ceiling (Y=128 or higher).");
+          return;
+        }
         // Reject temporary or explosive supports before storing any registration.
         // Bed-use and TNT ignition can remove an attached sign without firing a
         // player sign-break event, leaving a stale database entry behind.
@@ -1233,6 +1247,9 @@ public final class WayBridge extends JavaPlugin implements Listener {
       }
       Location location=target.location();
       if(location==null){player.sendMessage("§cTarget world is unavailable.");return;}
+      if(netherRoof(location.getWorld(), location.getBlockY())){
+        player.sendMessage("§cTeleportation above the Nether ceiling is not permitted.");return;
+      }
       UUID token=UUID.randomUUID();
       activeTeleports.put(playerId,token);
       teleportOrigins.put(playerId,player.getLocation().clone());
@@ -1250,6 +1267,9 @@ public final class WayBridge extends JavaPlugin implements Listener {
                 Store.Entry current=store.target(name);
                 if(current==null||!current.equals(target)||!targetId.equals(store.targetId(current))){
                   failTeleport(player,token,"§cThis warp's target has changed or is missing.");return;
+                }
+                if(netherRoof(location.getWorld(), location.getBlockY())){
+                  failTeleport(player,token,"§cTeleportation above the Nether ceiling is not permitted.");return;
                 }
                 if(!player.hasPermission("waybridge.use")||(!store.allowed(current,playerId)&&!admin(player))){
                   failTeleport(player,token,"§cYou no longer have permission to use this WarpTarget.");return;
@@ -1283,6 +1303,10 @@ public final class WayBridge extends JavaPlugin implements Listener {
                 if(!player.hasPermission("waybridge.use")
                     || (!store.allowed(finalTarget,playerId) && !admin(player))) {
                   failTeleport(player,token,"§cYou no longer have permission to use this WarpTarget.");return;
+                }
+                if (netherRoof(location.getWorld(), location.getBlockY())
+                    || netherRoof(arrival.getWorld(), arrival.getBlockY())) {
+                  failTeleport(player,token,"§cTeleportation above the Nether ceiling is not permitted.");return;
                 }
                 if (!arrivalStillSafe(arrival)) {
                   failTeleport(player,token,"§cThe safe arrival area has changed. Teleport cancelled.");return;

@@ -1,5 +1,5 @@
 name: WayBridge
-version: 1.0.6
+version: 1.0.7
 main: com.iruixos.waybridge.WayBridge
 api-version: '26.3'
 author: iruixos
