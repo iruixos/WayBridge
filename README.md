@@ -22,6 +22,7 @@
 - **Configurable countdown and effects:** Title/actionbar countdown, cancellation on movement or damage, sound and particle feedback.
 - **Protection and integration:** Prevents unauthorized modification/destruction; respects WorldGuard build permissions when enabled, and exposes `isRegisteredSign(Block)` for integrations such as VanillaPlusSuite.
 - **SignWarpX migration:** Guided migration wizard with previews, backups, progress indicators, and guided rollback for eligible new migrations.
+- **Environmental sign integrity (1.0.6):** Protects sign supports, restricts TNT and straw-bed attachments, warns about gravity-affected supports, and reconciles confirmed environmental sign destruction.
 - **Performance controls:** Rate-limited chunk sign synchronization, optional rotating diagnostics under `logs/WayBridge/`, and command tab completion.
 
 ## Installation
@@ -68,7 +69,7 @@ Use `[Warp]` or the compact `[WP]` alias on line 1. Right-click a registered War
 
 A destination must exist before a connecting Warp sign can be registered. Destinations on separate Paper worlds are supported; separate proxy backend servers are not.
 
-## Safe arrival: technical details (1.0.5)
+## Safe arrival: technical details (1.0.5+)
 
 WayBridge treats the WarpTarget sign as the **destination reference**, not as a guaranteed player spawn point. A sign may be suspended above the ground, attached to a cliff, underwater, or surrounded by hazards. The plugin attempts to find a nearby location where a player can arrive safely; if no candidate passes its checks, **teleportation is refused** rather than forcing an unsafe arrival.
 
@@ -197,9 +198,41 @@ performance:
 
 With diagnostics enabled and the server restarted, aggregate performance data is written to `logs/WayBridge/diagnostics-0.log`, with rotating backups. Warnings and errors remain in Paper's standard `logs/latest.log`.
 
-## Sign integrity and repair (1.0.5)
+## Sign integrity and repair (1.0.5–1.0.6)
 
-WayBridge protects registered signs against direct unauthorized breaking and supporting-block removal, including applicable piston and explosion events. Third-party plugins that modify blocks without standard Paper events can still bypass these protections. The repair workflow helps administrators identify registrations whose physical signs are already missing.
+WayBridge protects registered signs against unauthorized direct breaking and deliberate removal of blocks supporting them, including applicable piston and explosion events. When a sign is legitimately removed, its registration must also be removed so linked-sign counts, access restrictions, and orphaned-target state remain consistent.
+
+### Supporting blocks, beds, TNT, and gravity
+
+- **Ordinary supporting blocks:** Player-initiated removal of a block that directly supports a registered sign is blocked. Players must remove their registered sign through the normal ownership-checked break path first.
+- **Ordinary beds:** The two halves of a bed are treated as a connected structure for protection purposes. Breaking the opposite half or relevant supporting blocks cannot be used to bypass sign removal protections.
+- **TNT and straw beds:** New `[WarpTarget]`, `[WPT]`, `[Warp]`, and `[WP]` registrations on these supports are rejected. Straw beds can disappear on use, and TNT can be ignited independently of normal sign breaking; WayBridge does not prevent those intended mechanics.
+- **Gravity-affected supports:** Registration on blocks such as sand, gravel, and concrete powder is allowed. WayBridge warns the creator that falling support may destroy the attached sign. The plugin does not cancel normal gravity simply to preserve the registration.
+
+A normal player attempt to break a supporting gravity block is still subject to existing sign protection. The special environmental cleanup applies when the support falls or another observed environmental change removes the sign naturally.
+
+### SignReconciliationService (1.0.6)
+
+WayBridge uses an internal `SignReconciliationService` to inspect and reconcile registered signs. The service distinguishes four physical-registration states: **valid**, **missing**, **conflicting**, and **unavailable**. Its cleanup rules are intentionally conservative:
+
+1. **Observed event:** A relevant falling-block, burning, fading, fluid, or sign-physics event identifies a potentially affected registered sign.
+2. **Delayed check:** WayBridge queues an identity-aware check after the world has had an opportunity to apply the block update. Duplicate notifications for the same sign are consolidated.
+3. **Loaded-world validation:** The service checks the physical block only when its world and chunk are available. If the chunk unloads, the check is deferred until it loads again.
+4. **Identity recheck:** Before deletion, it confirms that the database registration still refers to the original sign. A newer registration at the same coordinates must not be removed by an old callback.
+5. **Confirmed cleanup:** When an observed environmental event has genuinely destroyed the sign, WayBridge removes its registration and reconciles related link state. Destroyed WarpTargets retain the established orphaned-link and name-reservation protections.
+6. **Database failure:** Transient SQLite cleanup errors are retried with bounded delays (20, 40, and 80 ticks). If retries are exhausted, the registration remains for administrator review using `/waybridge repair scan`.
+
+When a chunk loads and WayBridge discovers an **unobserved** missing sign, it reports the discrepancy instead of automatically deleting it. A physical sign that exists but conflicts with the stored registration is also preserved for inspection rather than overwritten or removed. This reduces the risk of deleting legitimate registrations after ambiguous world changes.
+
+Environmental cleanup messages appear in Paper's normal console and `logs/latest.log`, using the **sign type, warp name, creator name (when resolvable), world name, block coordinates, and destruction reason** rather than only a world UUID. For example:
+
+```text
+[WayBridge] Environmentally destroyed WarpTarget sign deregistered: Warp: "Home" | Creator: PlayerName | World: world | Location: -181, 84, 33 | Reason: Falling support
+```
+
+### Administrator repair
+
+Third-party plugins, commands, or world editors may alter blocks without firing the normal Paper events. The repair workflow remains the fallback for registrations whose physical signs are unexpectedly missing.
 
 ```text
 /waybridge repair scan
@@ -207,7 +240,7 @@ WayBridge protects registered signs against direct unauthorized breaking and sup
 /waybridge repair cleanup
 ```
 
-The scan examines **already-loaded chunks only** and differentiates missing blocks from conflicts; it does not load an entire world. Cleanup requires confirmation, rechecks candidates, and creates a database backup. Back up your plugin data and worlds before performing cleanup.
+The scan examines **already-loaded chunks only** and differentiates missing blocks from conflicts; it does not load an entire world. Cleanup requires confirmation, rechecks candidates, and creates a database backup. Back up your plugin data and worlds before performing cleanup. Pending automatic reconciliation checks are held in memory and do not survive a server restart; the repair workflow can recover from missed events.
 
 ## SignWarpX migration and rollback
 
@@ -232,7 +265,8 @@ Use it on the enabled WayBridge plugin instance, on the main server thread. It r
 - WarpTarget names are case-insensitive and globally unique.
 - Destroying a WarpTarget can leave orphaned Warp signs. Their old identity is not reassigned automatically to a replacement with the same name; an authorized user can relink them.
 - WayBridge cannot intercept every direct sign change made by arbitrary third-party plugins or NMS modifications.
-- **Version 1.0.5:** Adds sign-integrity repair and supporting-block protection, plus improved safe-arrival searching and validation. See the GitHub releases for version-specific changes.
+- **Version 1.0.5:** Added sign-integrity repair, supporting-block protection, and improved safe-arrival searching and validation.
+- **Version 1.0.6:** Adds bed-structure protection, restrictions for TNT/straw-bed supports, gravity warnings and automatic environmental cleanup, a central reconciliation service, informative destruction logs, and bounded SQLite cleanup retries. See GitHub Releases for version-specific changes.
 
 ## Project information
 
