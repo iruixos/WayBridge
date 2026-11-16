@@ -22,8 +22,8 @@ import java.util.UUID;
 
 /** Administrator-only, opt-in integrity scan. Never force-loads chunks. */
 final class Repair {
-  private enum Condition { MISSING, CONFLICT, VALID, UNAVAILABLE }
-  private record Candidate(Store.Entry entry, String targetId, Condition condition) {}
+  private final SignReconciliationService reconciliation;
+  private record Candidate(Store.Entry entry, String targetId, SignReconciliationService.Condition condition) {}
   private record Preview(UUID token,long expires,List<Candidate> missing) {}
   private final WayBridge plugin;
   private final Store store;
@@ -31,23 +31,12 @@ final class Repair {
   private List<Candidate> lastScan=List.of();
   private static final int EXPIRY_SECONDS=60;
 
-  Repair(WayBridge plugin,Store store){this.plugin=plugin;this.store=store;}
+  Repair(WayBridge plugin,Store store,SignReconciliationService reconciliation){this.plugin=plugin;this.store=store;this.reconciliation=reconciliation;}
   void clear(){previews.clear();lastScan=List.of();}
   private void say(CommandSender sender,String message){sender.sendMessage("§b[WayBridge]: §f"+message);}
   private String actor(CommandSender sender){return sender instanceof org.bukkit.entity.Player p?p.getUniqueId().toString():"CONSOLE";}
-  private Condition check(Store.Entry e){
-    World world=Bukkit.getWorld(e.world());
-    if(world==null||!world.isChunkLoaded(e.x()>>4,e.z()>>4))return Condition.UNAVAILABLE;
-    Block block=world.getBlockAt(e.x(),e.y(),e.z());
-    if(!(block.getState() instanceof Sign sign))return Condition.MISSING;
-    String header=net.kyori.adventure.text.serializer.plain.PlainTextComponentSerializer.plainText()
-        .serialize(sign.getSide(Side.FRONT).line(0)).trim().toLowerCase(Locale.ROOT);
-    String name=net.kyori.adventure.text.serializer.plain.PlainTextComponentSerializer.plainText()
-        .serialize(sign.getSide(Side.FRONT).line(1)).trim();
-    boolean kindOk=e.kind().equals("TARGET")
-        ?header.equals("[warptarget]")||header.equals("[wpt]")
-        :header.equals("[warp]")||header.equals("[wp]");
-    return kindOk&&name.equalsIgnoreCase(e.name())?Condition.VALID:Condition.CONFLICT;
+  private SignReconciliationService.Condition check(Store.Entry e) {
+    return reconciliation.classify(e);
   }
   void command(CommandSender sender,String[] args){
     if(args.length==0){say(sender,"Usage: /waybridge repair scan | list | cleanup");return;}
@@ -68,15 +57,15 @@ final class Repair {
     previews.clear();
     List<Candidate> results=new ArrayList<>();
     for(Store.Entry entry:store.all()){
-      Condition state=check(entry);
+      SignReconciliationService.Condition state=check(entry);
       String id=store.targetId(entry);
       results.add(new Candidate(entry,id,state));
     }
     lastScan=List.copyOf(results);
-    long missing=results.stream().filter(c->c.condition()==Condition.MISSING).count();
-    long conflict=results.stream().filter(c->c.condition()==Condition.CONFLICT).count();
-    long valid=results.stream().filter(c->c.condition()==Condition.VALID).count();
-    long unavailable=results.stream().filter(c->c.condition()==Condition.UNAVAILABLE).count();
+    long missing=results.stream().filter(c->c.condition()==SignReconciliationService.Condition.MISSING).count();
+    long conflict=results.stream().filter(c->c.condition()==SignReconciliationService.Condition.CONFLICT).count();
+    long valid=results.stream().filter(c->c.condition()==SignReconciliationService.Condition.VALID).count();
+    long unavailable=results.stream().filter(c->c.condition()==SignReconciliationService.Condition.UNAVAILABLE).count();
     say(sender,"Scan complete: "+valid+" valid, "+missing+" missing, "+conflict+" conflicts, "+unavailable+" unavailable/unloaded.");
     say(sender,"Only loaded chunks were inspected. No chunks were loaded and nothing was deleted.");
     if(missing+conflict>0)say(sender,"Use /waybridge repair list to review findings.");
@@ -85,7 +74,7 @@ final class Repair {
     if(lastScan.isEmpty()){say(sender,"No scan results. Run /waybridge repair scan first.");return;}
     int displayed=0;
     for(Candidate c:lastScan){
-      if(c.condition()!=Condition.MISSING&&c.condition()!=Condition.CONFLICT)continue;
+      if(c.condition()!=SignReconciliationService.Condition.MISSING&&c.condition()!=SignReconciliationService.Condition.CONFLICT)continue;
       if(++displayed>25)break;
       Store.Entry e=c.entry();
       sender.sendMessage("§7"+c.condition()+" §f"+e.kind()+" §5"+e.name()+" §7"+e.position());
@@ -94,7 +83,7 @@ final class Repair {
   }
   private void cleanup(CommandSender sender) throws SQLException {
     if(lastScan.isEmpty()){say(sender,"Run /waybridge repair scan first.");return;}
-    List<Candidate> missing=lastScan.stream().filter(c->c.condition()==Condition.MISSING).toList();
+    List<Candidate> missing=lastScan.stream().filter(c->c.condition()==SignReconciliationService.Condition.MISSING).toList();
     if(missing.isEmpty()){say(sender,"No missing registrations eligible for cleanup.");return;}
     UUID token=UUID.randomUUID();
     previews.put(actor(sender),new Preview(token,System.currentTimeMillis()+EXPIRY_SECONDS*1000L,missing));
@@ -117,7 +106,7 @@ final class Repair {
       Store.Entry current=store.at(candidate.entry().location());
       if(current!=null&&current.equals(candidate.entry())
           &&java.util.Objects.equals(store.targetId(current),candidate.targetId())
-          &&check(current)==Condition.MISSING)eligible.add(current);
+          &&check(current)==SignReconciliationService.Condition.MISSING)eligible.add(current);
       else skipped++;
     }
     if(eligible.isEmpty()){say(sender,"No registrations remain eligible for cleanup. Skipped "+skipped+" changed/unavailable entries.");return;}
@@ -132,10 +121,9 @@ final class Repair {
       Candidate original=preview.missing().stream().filter(c->c.entry().equals(entry)).findFirst().orElse(null);
       if(current==null||!current.equals(entry)||original==null
           ||!java.util.Objects.equals(store.targetId(current),original.targetId())
-          ||check(current)!=Condition.MISSING){skipped++;continue;}
-      store.remove(current);
-      removed++;
-      plugin.refresh(entry.name(),entry.kind().equals("TARGET")?entry.owner():entry.targetOwner());
+          ||check(current)!=SignReconciliationService.Condition.MISSING){skipped++;continue;}
+      if(reconciliation.cleanupIfMissing(current, original.targetId(), null))removed++;
+      else skipped++;
     }
     plugin.getLogger().warning("Repair cleanup by "+sender.getName()+": removed "+removed+" stale registrations, skipped "+skipped+"; pre-cleanup backup "+backup.getPath());
     say(sender,"Removed "+removed+" missing registrations; skipped "+skipped+". Database backup: "+backup.getPath());

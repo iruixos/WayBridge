@@ -32,6 +32,10 @@ import org.bukkit.event.EventPriority;
 import org.bukkit.event.Listener;
 import org.bukkit.event.block.Action;
 import org.bukkit.event.block.BlockBreakEvent;
+import org.bukkit.event.block.BlockBurnEvent;
+import org.bukkit.event.block.BlockFadeEvent;
+import org.bukkit.event.block.BlockFromToEvent;
+import org.bukkit.event.entity.EntityChangeBlockEvent;
 import org.bukkit.event.block.BlockExplodeEvent;
 import org.bukkit.event.block.BlockPhysicsEvent;
 import org.bukkit.event.block.BlockPistonExtendEvent;
@@ -93,6 +97,7 @@ public final class WayBridge extends JavaPlugin implements Listener {
   private Store store;
   private Migration migration;
   private Repair repair;
+  private SignReconciliationService reconciliation;
   private final Map<UUID, PendingTeleport> pendingTeleports = new HashMap<>();
   // A player has at most one countdown/chunk-load/teleport operation in flight.
   // Generation tokens invalidate callbacks after disconnect, death or replacement.
@@ -174,7 +179,8 @@ public final class WayBridge extends JavaPlugin implements Listener {
     refreshWorker=Bukkit.getScheduler().runTaskTimer(this,this::processRefreshQueue,1L,1L);
     diagnosticWorker=Bukkit.getScheduler().runTaskTimer(this,this::logPerformance,1200L,1200L);
     migration=new Migration(this,store);
-    repair=new Repair(this,store);
+    reconciliation=new SignReconciliationService(this,store);
+    repair=new Repair(this,store,reconciliation);
     Objects.requireNonNull(getCommand("waybridge")).setExecutor((sender,cmd,label,args)->{
       if(args.length==0||args[0].equalsIgnoreCase("help")) {
         int page=1;
@@ -341,7 +347,7 @@ public final class WayBridge extends JavaPlugin implements Listener {
       getLogger().warning("Could not count registered signs: " + ex.getMessage());
     }
   }
-  @Override public void onDisable(){if(repair!=null)repair.clear();if(refreshWorker!=null)refreshWorker.cancel();if(diagnosticWorker!=null)diagnosticWorker.cancel();pendingRefreshChunks.clear();queuedRefreshChunks.clear();pendingSignRefreshes.clear();dirtyTargets.clear();activeTeleports.clear();teleportOrigins.clear();waybridgeTeleportEvents.clear();for(UUID id:new ArrayList<>(pendingTeleports.keySet())) cancelCountdown(id,null);privacySelections.clear();relinkSelections.clear();pendingReservations.clear();if(migration!=null)migration.stop();if(store!=null)try{store.close();}catch(Exception e){getLogger().warning(e.toString());}closeDiagnosticLogging();}
+  @Override public void onDisable(){if(repair!=null)repair.clear();if(refreshWorker!=null)refreshWorker.cancel();if(diagnosticWorker!=null)diagnosticWorker.cancel();pendingRefreshChunks.clear();queuedRefreshChunks.clear();pendingSignRefreshes.clear();dirtyTargets.clear();if(reconciliation!=null)reconciliation.clear();activeTeleports.clear();teleportOrigins.clear();waybridgeTeleportEvents.clear();for(UUID id:new ArrayList<>(pendingTeleports.keySet())) cancelCountdown(id,null);privacySelections.clear();relinkSelections.clear();pendingReservations.clear();if(migration!=null)migration.stop();if(store!=null)try{store.close();}catch(Exception e){getLogger().warning(e.toString());}closeDiagnosticLogging();}
   private void error(Exception ex){getLogger().severe("Database error: "+ex);}
   private boolean admin(Player p){return p.isOp()||p.hasPermission("waybridge.admin");}
   private boolean region(Player p,Location l){
@@ -384,7 +390,11 @@ public final class WayBridge extends JavaPlugin implements Listener {
       World world=Bukkit.getWorld(key.world());
       if(world==null||!world.isChunkLoaded(key.x(),key.z()))continue;
       long start=System.nanoTime();
-      try {pendingSignRefreshes.addAll(store.inChunk(key.world(),key.x(),key.z()));}
+      try {
+        List<Store.Entry> entries=store.inChunk(key.world(),key.x(),key.z());
+        pendingSignRefreshes.addAll(entries);
+        if(reconciliation!=null)reconciliation.inspectLoadedChunk(entries);
+      }
       catch(SQLException ex){error(ex);}
       finally {chunkLookupNanos+=System.nanoTime()-start;chunkLookups++;}
     }
@@ -821,6 +831,14 @@ public final class WayBridge extends JavaPlugin implements Listener {
       Block b=event.getBlock();if(!(b.getState() instanceof Sign sign))return;
       try {
         if(store.at(b.getLocation())!=null)return;
+        // Reject temporary or explosive supports before storing any registration.
+        // Bed-use and TNT ignition can remove an attached sign without firing a
+        // player sign-break event, leaving a stale database entry behind.
+        String unsafeSupport=unsafeRegistrationSupport(b);
+        if(unsafeSupport!=null){
+          rejectWarp(b,p,"WayBridge signs cannot be attached to "+unsafeSupport+". Place the sign on a permanent block instead.");
+          return;
+        }
         Store.Entry t=store.target(name);UUID claim=store.claim(name);
         if(target&&(t!=null||(claim!=null&&!claim.equals(p.getUniqueId())))){p.sendMessage("§cThat warp name is already reserved.");return;}
         if(warp&&t==null){rejectWarp(b,p,"Create the WarpTarget first.");return;}
@@ -834,13 +852,52 @@ public final class WayBridge extends JavaPlugin implements Listener {
         effect(b.getLocation(),target?"target-created":"link-created");
         if(warp)effect(t.location(),"linked-target");
         registrationMessage(p,e,true);
+        Block support=signSupport(b);
+        if(support!=null && support.getType().hasGravity()){
+          p.sendMessage("§e[WayBridge] Warning: This sign is attached to a gravity-affected block ("+support.getType().name().toLowerCase(Locale.ROOT).replace('_',' ')+").");
+          p.sendMessage("§eIf the support falls and destroys the sign, WayBridge will deregister the warp automatically.");
+        }
       }catch(SQLException ex){error(ex);p.sendMessage("§cRegistration failed; check server logs.");}
     });
+  }
+  // A sign's attachment must remain intact beyond player-triggered block breaks.
+  // Single-use straw beds disappear after use, and TNT can ignite/explode without
+  // a sign-break event. Refuse those supports at registration for either sign kind.
+  private Block signSupport(Block signBlock) {
+    var data=signBlock.getBlockData();
+    String type=signBlock.getType().name();
+    if(type.contains("WALL_") && data instanceof org.bukkit.block.data.Directional directional)
+      return signBlock.getRelative(directional.getFacing().getOppositeFace());
+    if(type.contains("HANGING_SIGN") && !type.contains("WALL_"))
+      return signBlock.getRelative(org.bukkit.block.BlockFace.UP);
+    if(type.endsWith("_SIGN") && !type.contains("WALL_") && !type.contains("HANGING_"))
+      return signBlock.getRelative(org.bukkit.block.BlockFace.DOWN);
+    return null;
+  }
+  private String unsafeRegistrationSupport(Block signBlock) {
+    Block support=signSupport(signBlock);
+    if(support==null)return null;
+    String material=support.getType().name();
+    if(material.equals("TNT"))return "TNT";
+    if(material.equals("STRAW_BED"))return "straw beds";
+    return null;
   }
   // A player can break an adjacent supporting block without directly breaking a sign.
   // Protect the support regardless of sign ownership: remove the sign directly
   // first so the existing ownership checks and deregistration path always run.
+  // Check direct physical attachments first. Beds are two-block structures: removing
+  // either half destroys the entire bed, including signs attached to the other half.
+  // The floor beneath either half can also cause the bed to pop off when removed.
   private boolean supportsRegisteredSign(Block support) {
+    if(directlySupportsRegisteredSign(support))return true;
+    if(support.getBlockData() instanceof org.bukkit.block.data.type.Bed)
+      return bedHasRegisteredSign(support);
+    Block above=support.getRelative(org.bukkit.block.BlockFace.UP);
+    if(above.getBlockData() instanceof org.bukkit.block.data.type.Bed)
+      return bedHasRegisteredSign(above);
+    return false;
+  }
+  private boolean directlySupportsRegisteredSign(Block support) {
     for(org.bukkit.block.BlockFace face : new org.bukkit.block.BlockFace[]{
         org.bukkit.block.BlockFace.UP,org.bukkit.block.BlockFace.DOWN,
         org.bukkit.block.BlockFace.NORTH,org.bukkit.block.BlockFace.SOUTH,
@@ -852,6 +909,19 @@ public final class WayBridge extends JavaPlugin implements Listener {
     }
     return false;
   }
+  private boolean bedHasRegisteredSign(Block half) {
+    if(!(half.getBlockData() instanceof org.bukkit.block.data.type.Bed bed))return false;
+    if(directlySupportsRegisteredSign(half))return true;
+    org.bukkit.block.BlockFace towardOther=bed.getPart()==org.bukkit.block.data.type.Bed.Part.FOOT
+        ? bed.getFacing() : bed.getFacing().getOppositeFace();
+    Block other=half.getRelative(towardOther);
+    // Only associate the two halves of the same intact bed, never a neighbouring bed.
+    if(!(other.getBlockData() instanceof org.bukkit.block.data.type.Bed otherBed)
+        || otherBed.getPart()==bed.getPart()
+        || otherBed.getFacing()!=bed.getFacing()
+        || other.getType()!=half.getType())return false;
+    return directlySupportsRegisteredSign(other);
+  }
   private boolean attachedTo(Block signBlock,Block support) {
     var data=signBlock.getBlockData();
     String type=signBlock.getType().name();
@@ -862,6 +932,31 @@ public final class WayBridge extends JavaPlugin implements Listener {
     if(type.endsWith("_SIGN") && !type.contains("WALL_") && !type.contains("HANGING_"))
       return signBlock.getRelative(org.bukkit.block.BlockFace.DOWN).equals(support);
     return false;
+  }
+  // Event handlers delegate environmental detection and identity-safe cleanup to
+  // SignReconciliationService. They never force-load chunks or cancel gravity.
+  private void queueReconciliation(Block signBlock, String reason) {
+    if(reconciliation!=null)reconciliation.queue(signBlock, reason);
+  }
+  private void watchAttachedSigns(Block support,String reason) {
+    if(reconciliation!=null)reconciliation.watchAttachedSigns(support, reason);
+  }
+  @EventHandler(priority=EventPriority.MONITOR,ignoreCancelled=true)
+  public void fallingBlockChange(EntityChangeBlockEvent event) {
+    if(!(event.getEntity() instanceof org.bukkit.entity.FallingBlock))return;
+    Block changed=event.getBlock();
+    // Falling entities can also land and turn back into blocks. Only inspect
+    // blocks that are being converted *from* a gravity-affected material.
+    if(changed.getType().hasGravity() && event.getTo()!=changed.getType())
+      watchAttachedSigns(changed,"falling support");
+  }
+  @EventHandler(priority=EventPriority.MONITOR,ignoreCancelled=true)
+  public void burnSupport(BlockBurnEvent event){watchAttachedSigns(event.getBlock(),"burning support");}
+  @EventHandler(priority=EventPriority.MONITOR,ignoreCancelled=true)
+  public void fadeSupport(BlockFadeEvent event){watchAttachedSigns(event.getBlock(),"support fade");}
+  @EventHandler(priority=EventPriority.MONITOR,ignoreCancelled=true)
+  public void fluidChange(BlockFromToEvent event){
+    if(signMaterial(event.getToBlock().getType()))queueReconciliation(event.getToBlock(),"fluid displacement");
   }
   @EventHandler(priority=EventPriority.LOWEST) public void protectBreak(BlockBreakEvent event){
     if(supportsRegisteredSign(event.getBlock())) {
@@ -1270,10 +1365,19 @@ public final class WayBridge extends JavaPlugin implements Listener {
     // SQLite for them. Wall and hanging signs remain protected.
     if(!signMaterial(event.getBlock().getType()))return;
     long started=System.nanoTime();
-    try{if(at(event.getBlock())!=null)event.setCancelled(true);}
-    finally{physicsLookupNanos+=System.nanoTime()-started;physicsLookups++;}
+    try{
+      if(at(event.getBlock())!=null) {
+        Block support=signSupport(event.getBlock());
+        // Let vanilla detach a sign whose support has vanished. Otherwise
+        // preserve the existing registered-sign protection.
+        if(support!=null && support.getType().isAir())
+          queueReconciliation(event.getBlock(),"missing support physics");
+        else event.setCancelled(true);
+      }
+    } finally{physicsLookupNanos+=System.nanoTime()-started;physicsLookups++;}
   }
   @EventHandler public void chunk(ChunkLoadEvent event){
+    if(reconciliation!=null)reconciliation.onChunkLoad(event.getWorld().getUID(),event.getChunk().getX(),event.getChunk().getZ());
     ChunkKey key=new ChunkKey(event.getWorld().getUID(),event.getChunk().getX(),event.getChunk().getZ());
     if(queuedRefreshChunks.add(key))pendingRefreshChunks.addLast(key);
     // Reconcile important target updates separately from the bounded cosmetic
